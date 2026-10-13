@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+a11y_report/
+*.csv
+*.json
+.DS_Store
