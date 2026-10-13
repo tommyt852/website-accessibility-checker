@@ -1,19 +1,27 @@
-# Website accessibility crawl
+# Website accessibility checker
 
-Crawl all same-domain pages via hyperlinks, then report common a11y gaps.
+Crawl all same-domain pages via hyperlinks and report WCAG 2.1 AA–oriented gaps.
 
 ## Checks
 
 **HTML pages**
-- `<html lang>` present
-- at least one `<h1>`
-- `<img>` missing / empty `alt`
-- CSS `background-image` (inline `style` or `<style>`) — flagged because there is no `alt`
+| Check | Severity | WCAG |
+| --- | --- | --- |
+| `<html lang>` missing | critical | 3.1.1 |
+| Mixed Chinese/English with no local `lang` | review | 3.1.2 |
+| No `<h1>` | serious | 1.3.1 / 2.4.6 |
+| Multiple `<h1>` | moderate | 1.3.1 / 2.4.6 |
+| Heading level skip (e.g. h2 → h4) | moderate | 1.3.1 / 2.4.6 |
+| `<img>` missing `alt` | critical | 1.1.1 |
+| `<img alt="">` (only OK if decorative) | review | 1.1.1 |
+| CSS `background-image` without accessible name / nearby text | serious | 1.1.1 |
 
-**PDFs linked from the site**
-- metadata Title / Subject (description)
-- tagged/marked PDF hint
-- `/Alt` alternative text when present in the PDF structure
+**PDFs** (linked from the site)
+| Check | Severity | WCAG |
+| --- | --- | --- |
+| Not tagged/marked | serious | 1.3.1 |
+| No `/Alt` on figures/structure | serious | 1.1.1 |
+| Missing Title/Subject metadata | review | — (helpful, **not** alternative text) |
 
 ## Setup
 
@@ -31,4 +39,4 @@ python a11y_crawl.py https://example.com/ -o a11y_report
 
 Options: `--max-pages 200`, `--delay 0.3`, `--no-robots`
 
-Outputs in the `-o` folder: `summary.txt`, `issues.csv`, `report.json`
+Outputs: `summary.txt` (by severity), `issues.csv`, `report.json`

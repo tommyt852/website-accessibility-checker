@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Crawl a domain and report basic accessibility issues.
+"""Crawl a domain and report WCAG-oriented accessibility signals (2.1 AA focus).
 
-Checks per HTML page:
-  - <html lang="...">
-  - at least one <h1>
-  - <img> alt (missing / empty)
-  - elements with CSS background-image (inline or <style>) — flagged (no alt)
+HTML pages:
+  - html[lang] (3.1.1); note when mixed scripts lack local lang (3.1.2)
+  - headings: missing h1, multiple h1, skipped levels (1.3.1 / 2.4.6)
+  - img alt: missing attr = critical; empty alt = review (decorative only) (1.1.1)
+  - CSS background-image: check aria-label / nearby text (1.1.1)
 
-Checks per discovered PDF:
-  - metadata Title / Subject (description)
-  - XMP / catalog hints for accessibility
-  - image XObjects with /Alt (alternative text) when present
+PDFs:
+  - Title/Subject metadata is advisory only (not a11y alt text)
+  - tagged/marked PDF + /Alt on figures (1.1.1 / 1.3.1)
 """
 
 from __future__ import annotations
@@ -33,18 +32,22 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from pypdf.generic import DictionaryObject, IndirectObject
 
-USER_AGENT = "WebsiteA11yCheck/1.0 (+local accessibility crawl)"
+USER_AGENT = "WebsiteA11yCheck/1.1 (+WCAG 2.1 AA crawl)"
 BG_IMAGE_RE = re.compile(
-    r"background(?:-image)?\s*:\s*[^;]*url\s*\(\s*['\"]?([^)'\"]+)['\"]?\s*\)",
+    r"background(?:-image)?\s*:\s*[^;]*url\s*\(\s*[\'\"]?([^)\'\"]+)[\'\"]?\s*\)",
     re.IGNORECASE,
 )
 SKIP_SCHEMES = {"mailto", "tel", "javascript", "data", "blob"}
+CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+LATIN_RE = re.compile(r"[A-Za-z]{3,}")
 
 
 @dataclass
 class Issue:
     page_url: str
     kind: str
+    severity: str  # critical | serious | moderate | review
+    wcag: str
     detail: str
     resource: str = ""
 
@@ -112,64 +115,197 @@ def fetch(
         return None
 
 
-def check_html_page(page_url: str, html: str, base: urlparse) -> tuple[list[Issue], set[str], set[str]]:
+def visible_text(el) -> str:
+    return " ".join(el.stripped_strings) if el else ""
+
+
+def has_accessible_name(el) -> bool:
+    if not el:
+        return False
+    for attr in ("aria-label", "aria-labelledby", "title"):
+        val = el.get(attr)
+        if val and str(val).strip():
+            return True
+    if visible_text(el).strip():
+        return True
+    # parent with aria-label often wraps icon backgrounds
+    parent = el.parent
+    if parent and parent.name not in {None, "[document]", "body", "html"}:
+        for attr in ("aria-label", "aria-labelledby", "title"):
+            val = parent.get(attr)
+            if val and str(val).strip():
+                return True
+        # short nearby text on parent
+        if visible_text(parent).strip():
+            return True
+    return False
+
+
+def check_headings(page_url: str, soup: BeautifulSoup) -> list[Issue]:
+    issues: list[Issue] = []
+    headings = []
+    for level in range(1, 7):
+        for h in soup.find_all(f"h{level}"):
+            headings.append(level)
+
+    h1_count = sum(1 for lv in headings if lv == 1)
+    if h1_count == 0:
+        issues.append(
+            Issue(
+                page_url,
+                "missing_h1",
+                "serious",
+                "1.3.1 / 2.4.6",
+                "page has no <h1>",
+            )
+        )
+    elif h1_count > 1:
+        issues.append(
+            Issue(
+                page_url,
+                "multiple_h1",
+                "moderate",
+                "1.3.1 / 2.4.6",
+                f"page has {h1_count} <h1> elements (prefer one main heading)",
+            )
+        )
+
+    # skipped levels in document order
+    prev = 0
+    for lv in headings:
+        if prev and lv > prev + 1:
+            issues.append(
+                Issue(
+                    page_url,
+                    "heading_level_skip",
+                    "moderate",
+                    "1.3.1 / 2.4.6",
+                    f"heading jumps from h{prev} to h{lv}",
+                )
+            )
+            break  # one skip note per page is enough signal
+        prev = lv
+    return issues
+
+
+def check_lang(page_url: str, soup: BeautifulSoup, html: str) -> list[Issue]:
+    issues: list[Issue] = []
+    html_tag = soup.find("html")
+    lang = (html_tag.get("lang") if html_tag else None) or ""
+    if not str(lang).strip():
+        issues.append(
+            Issue(
+                page_url,
+                "missing_html_lang",
+                "critical",
+                "3.1.1",
+                "<html> has no lang attribute",
+            )
+        )
+
+    # mixed CJK + Latin without any local lang attributes
+    sample = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)[:8000]
+    has_cjk = bool(CJK_RE.search(sample))
+    has_latin = bool(LATIN_RE.search(sample))
+    local_langs = soup.find_all(attrs={"lang": True})
+    # exclude the html root itself
+    local_langs = [el for el in local_langs if el.name != "html"]
+    if has_cjk and has_latin and not local_langs:
+        issues.append(
+            Issue(
+                page_url,
+                "mixed_language_no_local_lang",
+                "review",
+                "3.1.2",
+                "page appears to mix Chinese and English without local lang attributes",
+            )
+        )
+    return issues
+
+
+def check_html_page(
+    page_url: str, html: str, base: urlparse
+) -> tuple[list[Issue], set[str], set[str]]:
     issues: list[Issue] = []
     links: set[str] = set()
     pdfs: set[str] = set()
     soup = BeautifulSoup(html, "html.parser")
 
-    html_tag = soup.find("html")
-    lang = (html_tag.get("lang") if html_tag else None) or ""
-    if not str(lang).strip():
-        issues.append(Issue(page_url, "missing_html_lang", "<html> has no lang attribute"))
-
-    h1s = soup.find_all("h1")
-    if not h1s:
-        issues.append(Issue(page_url, "missing_h1", "page has no <h1>"))
+    issues.extend(check_lang(page_url, soup, html))
+    issues.extend(check_headings(page_url, soup))
 
     for img in soup.find_all("img"):
         src = (img.get("src") or img.get("data-src") or "").strip()
         abs_src = urljoin(page_url, src) if src else ""
+        role = (img.get("role") or "").lower()
         if img.has_attr("alt"):
-            if str(img.get("alt", "")).strip() == "" and not img.get("role") == "presentation":
-                # empty alt can be intentional for decorative; still report for review
+            alt = str(img.get("alt", ""))
+            if alt.strip() == "":
+                if role == "presentation" or role == "none":
+                    continue  # explicitly decorative
                 issues.append(
                     Issue(
                         page_url,
                         "empty_img_alt",
-                        "img alt is empty (decorative?) — review",
+                        "review",
+                        "1.1.1",
+                        "img alt is empty — OK only if decorative; informative images need meaningful text",
                         abs_src,
                     )
                 )
         else:
             issues.append(
-                Issue(page_url, "missing_img_alt", "img missing alt attribute", abs_src)
+                Issue(
+                    page_url,
+                    "missing_img_alt",
+                    "critical",
+                    "1.1.1",
+                    "img missing alt attribute",
+                    abs_src,
+                )
             )
 
     # inline style background-image
     for el in soup.find_all(style=True):
-        for bg in extract_bg_urls_from_css(el.get("style", "")):
-            abs_bg = urljoin(page_url, bg)
-            tag = el.name or "element"
+        bgs = extract_bg_urls_from_css(el.get("style", ""))
+        if not bgs:
+            continue
+        tag = el.name or "element"
+        if has_accessible_name(el):
             issues.append(
                 Issue(
                     page_url,
-                    "css_background_image",
-                    f"<{tag}> uses CSS background-image (no alt possible; needs accessible text nearby)",
-                    abs_bg,
+                    "css_background_image_ok_name",
+                    "review",
+                    "1.1.1",
+                    f"<{tag}> has CSS background-image and an accessible name nearby — confirm equivalence",
+                    urljoin(page_url, bgs[0]),
                 )
             )
+        else:
+            for bg in bgs:
+                issues.append(
+                    Issue(
+                        page_url,
+                        "css_background_image_missing_text",
+                        "serious",
+                        "1.1.1",
+                        f"<{tag}> CSS background-image may lack equivalent text / aria-label",
+                        urljoin(page_url, bg),
+                    )
+                )
 
-    # <style> blocks
+    # <style> blocks — cannot bind to one element; flag as review
     for style_tag in soup.find_all("style"):
         for bg in extract_bg_urls_from_css(style_tag.string or ""):
-            abs_bg = urljoin(page_url, bg)
             issues.append(
                 Issue(
                     page_url,
-                    "css_background_image",
-                    "<style> declares background-image (no alt; needs accessible alternative)",
-                    abs_bg,
+                    "css_background_image_in_stylesheet",
+                    "review",
+                    "1.1.1",
+                    "<style> declares background-image — verify visible/accessible equivalent on the page",
+                    urljoin(page_url, bg),
                 )
             )
 
@@ -188,7 +324,6 @@ def check_html_page(page_url: str, html: str, base: urlparse) -> tuple[list[Issu
         else:
             links.add(abs_url)
 
-    # also catch direct pdf / asset links in other tags
     for tag in soup.find_all(["iframe", "embed", "object", "link", "source"]):
         for attr in ("href", "src", "data"):
             if not tag.has_attr(attr):
@@ -235,15 +370,23 @@ def check_pdf(session: requests.Session, pdf_url: str, tmp_dir: Path) -> list[Is
     issues: list[Issue] = []
     resp = fetch(session, pdf_url, stream=True)
     if resp is None:
-        issues.append(Issue(pdf_url, "pdf_fetch_failed", "could not download PDF", pdf_url))
+        issues.append(
+            Issue(pdf_url, "pdf_fetch_failed", "moderate", "", "could not download PDF", pdf_url)
+        )
         return issues
 
     ctype = resp.headers.get("Content-Type", "")
     if not is_pdf_url(pdf_url, ctype) and "pdf" not in ctype.lower():
-        # still try if extension says pdf
         if not pdf_url.lower().endswith(".pdf"):
             issues.append(
-                Issue(pdf_url, "pdf_not_pdf", f"URL does not look like PDF ({ctype})", pdf_url)
+                Issue(
+                    pdf_url,
+                    "pdf_not_pdf",
+                    "review",
+                    "",
+                    f"URL does not look like PDF ({ctype})",
+                    pdf_url,
+                )
             )
             return issues
 
@@ -257,54 +400,42 @@ def check_pdf(session: requests.Session, pdf_url: str, tmp_dir: Path) -> list[Is
                 if chunk:
                     f.write(chunk)
     except OSError as exc:
-        issues.append(Issue(pdf_url, "pdf_save_failed", str(exc), pdf_url))
+        issues.append(
+            Issue(pdf_url, "pdf_save_failed", "moderate", "", str(exc), pdf_url)
+        )
         return issues
 
     try:
         reader = PdfReader(str(path))
     except Exception as exc:  # noqa: BLE001
-        issues.append(Issue(pdf_url, "pdf_parse_failed", f"cannot parse PDF: {exc}", pdf_url))
-        return issues
-
-    meta = reader.metadata or {}
-    title = (meta.get("/Title") if meta else None) or ""
-    subject = (meta.get("/Subject") if meta else None) or ""
-    title_s = str(title).strip() if title else ""
-    subject_s = str(subject).strip() if subject else ""
-
-    if not title_s and not subject_s:
         issues.append(
             Issue(
                 pdf_url,
-                "pdf_missing_description",
-                "PDF has no Title or Subject metadata (description / 替代文字)",
+                "pdf_parse_failed",
+                "moderate",
+                "",
+                f"cannot parse PDF: {exc}",
                 pdf_url,
             )
         )
-    elif not subject_s and not title_s:
-        pass
-    else:
-        # if only one is present, note lightly
-        if not title_s:
-            issues.append(
-                Issue(
-                    pdf_url,
-                    "pdf_missing_title",
-                    "PDF has Subject but no Title metadata",
-                    pdf_url,
-                )
-            )
-        if not subject_s:
-            issues.append(
-                Issue(
-                    pdf_url,
-                    "pdf_missing_subject",
-                    "PDF has Title but no Subject (description) metadata",
-                    pdf_url,
-                )
-            )
+        return issues
 
-    # Marked/Tagged PDF?
+    # Metadata is advisory only — not a substitute for accessible alternative text
+    meta = reader.metadata or {}
+    title = str(meta.get("/Title") or "").strip()
+    subject = str(meta.get("/Subject") or "").strip()
+    if not title and not subject:
+        issues.append(
+            Issue(
+                pdf_url,
+                "pdf_missing_metadata_description",
+                "review",
+                "",
+                "PDF has no Title/Subject metadata (helpful, but NOT WCAG alternative text)",
+                pdf_url,
+            )
+        )
+
     root = reader.trailer.get("/Root") if reader.trailer else None
     root = _unwrap(root) if root else None
     marked = False
@@ -317,7 +448,9 @@ def check_pdf(session: requests.Session, pdf_url: str, tmp_dir: Path) -> list[Is
             Issue(
                 pdf_url,
                 "pdf_not_tagged",
-                "PDF does not appear to be a tagged/marked PDF (harder for screen readers)",
+                "serious",
+                "1.3.1",
+                "PDF does not appear tagged/marked — structure may be inaccessible",
                 pdf_url,
             )
         )
@@ -337,7 +470,9 @@ def check_pdf(session: requests.Session, pdf_url: str, tmp_dir: Path) -> list[Is
             Issue(
                 pdf_url,
                 "pdf_missing_alt_text",
-                "no /Alt alternative text found on PDF structure or images",
+                "serious",
+                "1.1.1",
+                "no /Alt alternative text found on PDF figures/structure",
                 pdf_url,
             )
         )
@@ -373,14 +508,18 @@ def crawl(
         if url in seen_pages:
             continue
         if robots and not robots.can_fetch(USER_AGENT, url):
-            report.issues.append(Issue(url, "robots_blocked", "blocked by robots.txt"))
+            report.issues.append(
+                Issue(url, "robots_blocked", "review", "", "blocked by robots.txt")
+            )
             seen_pages.add(url)
             continue
 
         resp = fetch(session, url)
         time.sleep(delay)
         if resp is None:
-            report.issues.append(Issue(url, "fetch_failed", "could not fetch page"))
+            report.issues.append(
+                Issue(url, "fetch_failed", "moderate", "", "could not fetch page")
+            )
             seen_pages.add(url)
             continue
 
@@ -397,10 +536,7 @@ def crawl(
                 report.pdfs_checked += 1
             continue
 
-        if "html" not in ctype.lower() and not final_url.endswith(
-            (".html", ".htm", "/")
-        ):
-            # skip non-html assets discovered as pages
+        if "html" not in ctype.lower() and not final_url.endswith((".html", ".htm", "/")):
             continue
 
         report.pages.append(final_url)
@@ -443,31 +579,42 @@ def write_outputs(report: CrawlReport, out_dir: Path) -> None:
             indent=2,
         )
 
+    fields = ["page_url", "kind", "severity", "wcag", "detail", "resource"]
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["page_url", "kind", "detail", "resource"])
+        w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for i in report.issues:
             w.writerow(asdict(i))
 
-    counts: dict[str, int] = {}
+    by_sev: dict[str, int] = {}
+    by_kind: dict[str, int] = {}
     for i in report.issues:
-        counts[i.kind] = counts.get(i.kind, 0) + 1
+        by_sev[i.severity] = by_sev.get(i.severity, 0) + 1
+        by_kind[i.kind] = by_kind.get(i.kind, 0) + 1
 
+    order = ["critical", "serious", "moderate", "review"]
     lines = [
         f"Start URL: {report.start_url}",
         f"Pages crawled: {report.pages_crawled}",
         f"PDFs checked: {report.pdfs_checked}",
         f"Issues: {len(report.issues)}",
         "",
-        "By kind:",
+        "By severity:",
     ]
-    for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+    for sev in order:
+        if sev in by_sev:
+            lines.append(f"  {sev}: {by_sev[sev]}")
+    lines.append("")
+    lines.append("By kind:")
+    for k, v in sorted(by_kind.items(), key=lambda kv: (-kv[1], kv[0])):
         lines.append(f"  {k}: {v}")
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Crawl a site and check basic a11y signals")
+    p = argparse.ArgumentParser(
+        description="Crawl a site and check WCAG-oriented a11y signals"
+    )
     p.add_argument("start_url", help="https://example.com/")
     p.add_argument("--max-pages", type=int, default=200)
     p.add_argument("--delay", type=float, default=0.3, help="seconds between requests")
