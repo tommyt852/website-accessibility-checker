@@ -19,8 +19,9 @@ import csv
 import json
 import re
 import sys
+import threading
 import time
-from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -32,7 +33,7 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from pypdf.generic import DictionaryObject, IndirectObject
 
-USER_AGENT = "WebsiteA11yCheck/1.1 (+WCAG 2.1 AA crawl)"
+USER_AGENT = "WebsiteA11yCheck/1.2 (+WCAG 2.1 AA crawl)"
 BG_IMAGE_RE = re.compile(
     r"background(?:-image)?\s*:\s*[^;]*url\s*\(\s*[\'\"]?([^)\'\"]+)[\'\"]?\s*\)",
     re.IGNORECASE,
@@ -486,74 +487,160 @@ def crawl(
     delay: float,
     respect_robots: bool,
     out_dir: Path,
+    workers: int = 1,
 ) -> CrawlReport:
     start_url = normalize_url(start_url)
     base = urlparse(start_url)
     if base.scheme not in {"http", "https"} or not base.netloc:
         raise SystemExit(f"Need an http(s) start URL, got: {start_url}")
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
+    workers = max(1, int(workers))
+    bootstrap = requests.Session()
+    bootstrap.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
+    robots = resolve_robots(bootstrap, base) if respect_robots else None
 
-    robots = resolve_robots(session, base) if respect_robots else None
     report = CrawlReport(start_url=start_url)
-    queue: deque[str] = deque([start_url])
+    lock = threading.Lock()
+    rate_lock = threading.Lock()
+    last_request = 0.0
     seen_pages: set[str] = set()
     seen_pdfs: set[str] = set()
+    pages_attempted = 0
     pdf_tmp = out_dir / "pdf_cache"
     pdf_tmp.mkdir(parents=True, exist_ok=True)
 
-    while queue and len(seen_pages) < max_pages:
-        url = queue.popleft()
-        if url in seen_pages:
-            continue
-        if robots and not robots.can_fetch(USER_AGENT, url):
-            report.issues.append(
-                Issue(url, "robots_blocked", "review", "", "blocked by robots.txt")
-            )
-            seen_pages.add(url)
-            continue
+    def throttle() -> None:
+        nonlocal last_request
+        with rate_lock:
+            now = time.monotonic()
+            wait_for = delay - (now - last_request)
+            if wait_for > 0:
+                time.sleep(wait_for)
+            last_request = time.monotonic()
 
-        resp = fetch(session, url)
-        time.sleep(delay)
-        if resp is None:
-            report.issues.append(
-                Issue(url, "fetch_failed", "moderate", "", "could not fetch page")
-            )
+    def make_session() -> requests.Session:
+        s = requests.Session()
+        s.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
+        return s
+
+    def claim_page(url: str) -> bool:
+        """Return True if this worker should fetch the URL as a page candidate."""
+        nonlocal pages_attempted
+        with lock:
+            if url in seen_pages:
+                return False
+            if pages_attempted >= max_pages:
+                return False
             seen_pages.add(url)
-            continue
+            pages_attempted += 1
+            return True
+
+    def claim_pdf(url: str) -> bool:
+        with lock:
+            if url in seen_pdfs:
+                return False
+            seen_pdfs.add(url)
+            report.pdfs.append(url)
+            return True
+
+    def enqueue_links(links: set[str], pdfs: set[str], submit_page, submit_pdf) -> None:
+        for link in sorted(links):
+            with lock:
+                already = link in seen_pages
+                at_cap = pages_attempted >= max_pages
+            if not already and not at_cap:
+                submit_page(link)
+        for pdf in sorted(pdfs):
+            with lock:
+                already = pdf in seen_pdfs
+            if not already:
+                submit_pdf(pdf)
+
+    def process_page(url: str) -> tuple[set[str], set[str]]:
+        if not claim_page(url):
+            return set(), set()
+
+        if robots and not robots.can_fetch(USER_AGENT, url):
+            with lock:
+                report.issues.append(
+                    Issue(url, "robots_blocked", "review", "", "blocked by robots.txt")
+                )
+            return set(), set()
+
+        session = make_session()
+        throttle()
+        resp = fetch(session, url)
+        if resp is None:
+            with lock:
+                report.issues.append(
+                    Issue(url, "fetch_failed", "moderate", "", "could not fetch page")
+                )
+            return set(), set()
 
         final_url = normalize_url(resp.url)
         ctype = resp.headers.get("Content-Type", "")
-        seen_pages.add(url)
-        seen_pages.add(final_url)
+        with lock:
+            seen_pages.add(final_url)
 
         if is_pdf_url(final_url, ctype):
-            if final_url not in seen_pdfs:
-                seen_pdfs.add(final_url)
-                report.pdfs.append(final_url)
-                report.issues.extend(check_pdf(session, final_url, pdf_tmp))
-                report.pdfs_checked += 1
-            continue
+            # redirected to PDF
+            if claim_pdf(final_url):
+                throttle()
+                pdf_issues = check_pdf(session, final_url, pdf_tmp)
+                with lock:
+                    report.issues.extend(pdf_issues)
+                    report.pdfs_checked += 1
+            return set(), set()
 
         if "html" not in ctype.lower() and not final_url.endswith((".html", ".htm", "/")):
-            continue
+            return set(), set()
 
-        report.pages.append(final_url)
-        report.pages_crawled += 1
         page_issues, links, pdfs = check_html_page(final_url, resp.text, base)
-        report.issues.extend(page_issues)
+        with lock:
+            report.pages.append(final_url)
+            report.pages_crawled += 1
+            report.issues.extend(page_issues)
+        return links, pdfs
 
-        for link in sorted(links):
-            if link not in seen_pages:
-                queue.append(link)
-        for pdf in sorted(pdfs):
-            if pdf not in seen_pdfs:
-                seen_pdfs.add(pdf)
-                report.pdfs.append(pdf)
-                report.issues.extend(check_pdf(session, pdf, pdf_tmp))
-                report.pdfs_checked += 1
-                time.sleep(delay)
+    def process_pdf(url: str) -> tuple[set[str], set[str]]:
+        if not claim_pdf(url):
+            return set(), set()
+        session = make_session()
+        throttle()
+        pdf_issues = check_pdf(session, url, pdf_tmp)
+        with lock:
+            report.issues.extend(pdf_issues)
+            report.pdfs_checked += 1
+        return set(), set()
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="a11y") as pool:
+        futures = set()
+
+        def submit_page(u: str) -> None:
+            futures.add(pool.submit(process_page, u))
+
+        def submit_pdf(u: str) -> None:
+            futures.add(pool.submit(process_pdf, u))
+
+        submit_page(start_url)
+        while futures:
+            done, futures = wait(futures, return_when=FIRST_COMPLETED)
+            for fut in done:
+                try:
+                    links, pdfs = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    with lock:
+                        report.issues.append(
+                            Issue(
+                                start_url,
+                                "worker_error",
+                                "moderate",
+                                "",
+                                f"worker failed: {exc}",
+                            )
+                        )
+                    continue
+                enqueue_links(links, pdfs, submit_page, submit_pdf)
 
     return report
 
@@ -617,7 +704,13 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("start_url", help="https://example.com/")
     p.add_argument("--max-pages", type=int, default=200)
-    p.add_argument("--delay", type=float, default=0.3, help="seconds between requests")
+    p.add_argument("--delay", type=float, default=0.3, help="min seconds between requests (global)")
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="parallel fetch workers (default 1 = sequential)",
+    )
     p.add_argument("--no-robots", action="store_true", help="ignore robots.txt")
     p.add_argument("-o", "--out", default="a11y_report", help="output directory")
     return p.parse_args(list(argv) if argv is not None else None)
@@ -632,12 +725,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         delay=args.delay,
         respect_robots=not args.no_robots,
         out_dir=out_dir,
+        workers=args.workers,
     )
     write_outputs(report, out_dir)
     print(f"Crawled {report.pages_crawled} pages, {report.pdfs_checked} PDFs")
     print(f"Found {len(report.issues)} issues")
     print(f"Wrote {out_dir / 'summary.txt'}, issues.csv, report.json")
     return 0
+
 
 
 if __name__ == "__main__":

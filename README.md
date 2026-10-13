@@ -35,8 +35,9 @@ pip install -r requirements.txt
 
 ```bash
 python a11y_crawl.py https://example.com/ -o a11y_report
+python a11y_crawl.py https://example.com/ --workers 4 --delay 0.2
 ```
 
-Options: `--max-pages 200`, `--delay 0.3`, `--no-robots`
+Options: `--max-pages 200`, `--delay 0.3` (global min gap between requests), `--workers 1` (parallel fetch workers; default sequential), `--no-robots`
 
 Outputs: `summary.txt` (by severity), `issues.csv`, `report.json`
