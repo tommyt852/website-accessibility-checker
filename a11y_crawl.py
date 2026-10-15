@@ -39,7 +39,7 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from pypdf.generic import DictionaryObject, IndirectObject
 
-USER_AGENT = "WebsiteA11yCheck/1.6 (+WCAG 2.1 AA crawl)"
+USER_AGENT = "WebsiteA11yCheck/1.7 (+WCAG 2.1 AA crawl)"
 BG_IMAGE_RE = re.compile(
     r"background(?:-image)?\s*:\s*[^;]*url\s*\(\s*[\'\"]?([^)\'\"]+)[\'\"]?\s*\)",
     re.IGNORECASE,
@@ -171,10 +171,80 @@ class Progress:
             sys.stderr.flush()
 
 
+ASSET_EXTENSIONS = {
+    ".css",
+    ".js",
+    ".mjs",
+    ".map",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".svg",
+    ".ico",
+    ".bmp",
+    ".avif",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".otf",
+    ".eot",
+    ".mp3",
+    ".mp4",
+    ".webm",
+    ".wav",
+    ".zip",
+    ".gz",
+    ".rar",
+    ".7z",
+    ".xml",  # feeds/sitemaps handled separately
+    ".json",
+}
+
+PAGE_EXTENSIONS = {
+    "",
+    ".html",
+    ".htm",
+    ".php",
+    ".asp",
+    ".aspx",
+    ".jsp",
+    ".cgi",
+    ".shtml",
+}
+
+
+def host_key(netloc: str) -> str:
+    """Treat www.example.com and example.com as the same site."""
+    host = (netloc or "").lower()
+    if "@" in host:  # userinfo@host
+        host = host.rsplit("@", 1)[-1]
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
 def same_site(base: urlparse, other: urlparse) -> bool:
     if other.scheme not in {"http", "https"}:
         return False
-    return other.netloc.lower() == base.netloc.lower()
+    return host_key(other.netloc) == host_key(base.netloc)
+
+
+def looks_like_html_page(url: str) -> bool:
+    path = urlparse(url).path or "/"
+    name = path.rsplit("/", 1)[-1]
+    if not name or name.endswith("/"):
+        return True
+    if "." not in name:
+        return True  # extensionless path → likely a page
+    ext = "." + name.rsplit(".", 1)[-1].lower()
+    if ext in ASSET_EXTENSIONS:
+        return False
+    if ext in PAGE_EXTENSIONS or ext.startswith(".htm"):
+        return True
+    # unknown extension: still try (could be .xhtml etc.)
+    return ext not in ASSET_EXTENSIONS
 
 
 def normalize_url(url: str) -> str:
@@ -440,31 +510,38 @@ def check_html_page(
                 )
             )
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
+    def consider(raw: str) -> None:
+        href = (raw or "").strip()
         if not href or href.startswith("#"):
-            continue
+            return
         abs_url = normalize_url(urljoin(page_url, href))
         parsed = urlparse(abs_url)
         if parsed.scheme in SKIP_SCHEMES:
-            continue
+            return
         if not same_site(base, parsed):
-            continue
+            return
         if is_pdf_url(abs_url):
             pdfs.add(abs_url)
-        else:
+            return
+        if looks_like_html_page(abs_url):
             links.add(abs_url)
 
-    for tag in soup.find_all(["iframe", "embed", "object", "link", "source"]):
-        for attr in ("href", "src", "data"):
-            if not tag.has_attr(attr):
-                continue
-            abs_url = normalize_url(urljoin(page_url, tag[attr].strip()))
-            parsed = urlparse(abs_url)
-            if not same_site(base, parsed):
-                continue
-            if is_pdf_url(abs_url):
-                pdfs.add(abs_url)
+    # <a href>, forms, and any href/src/data-src style refs (root- or path-relative)
+    link_attrs = (
+        "href",
+        "src",
+        "data",
+        "action",
+        "formaction",
+        "poster",
+        "data-src",
+        "data-href",
+        "data-url",
+    )
+    for tag in soup.find_all(True):
+        for attr in link_attrs:
+            if tag.has_attr(attr):
+                consider(tag.get(attr))
 
     return issues, links, pdfs
 

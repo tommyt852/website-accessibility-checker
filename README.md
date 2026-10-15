@@ -4,6 +4,9 @@ Crawl all same-domain pages via hyperlinks and report WCAG 2.1 AA–oriented gap
 
 **Target OS:** Windows (also works on macOS/Linux). Live progress on the console. Ctrl+C saves a checkpoint; `--resume` continues later. Seeds URLs from `sitemap.xml` (and robots.txt `Sitemap:`) by default for better coverage.
 
+Crawl rule: follow any same-site URL that is not clearly another domain (`www` ≡ bare domain; relative and root-relative `href`/`src`/`data-src`/…). Skips obvious static assets (`.js`, images, fonts, …).
+
+
 ## Checks
 
 **HTML pages**
