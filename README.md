@@ -23,7 +23,9 @@ Crawl all same-domain pages via hyperlinks and report WCAG 2.1 AA–oriented gap
 | --- | --- | --- |
 | Not tagged/marked | serious | 1.3.1 |
 | No `/Alt` on figures/structure | serious | 1.1.1 |
-| Missing Title/Subject metadata | review | — (helpful, **not** alternative text) |
+| Missing PDF `/Title` (document title) | serious | 2.4.2 |
+| `/Title` is just the filename | serious | 2.4.2 |
+| Missing `/Subject` metadata | review | — (helpful, **not** alternative text) |
 
 ## Windows one-click
 

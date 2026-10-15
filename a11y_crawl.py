@@ -11,7 +11,8 @@ HTML pages:
   - CSS background-image: check aria-label / nearby text (1.1.1)
 
 PDFs:
-  - Title/Subject metadata is advisory only (not a11y alt text)
+  - Document title must come from PDF /Title metadata (not the filename)
+  - Subject metadata is advisory only (not a11y alt text)
   - tagged/marked PDF + /Alt on figures (1.1.1 / 1.3.1)
 """
 
@@ -37,7 +38,7 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from pypdf.generic import DictionaryObject, IndirectObject
 
-USER_AGENT = "WebsiteA11yCheck/1.4 (+WCAG 2.1 AA crawl)"
+USER_AGENT = "WebsiteA11yCheck/1.5 (+WCAG 2.1 AA crawl)"
 BG_IMAGE_RE = re.compile(
     r"background(?:-image)?\s*:\s*[^;]*url\s*\(\s*[\'\"]?([^)\'\"]+)[\'\"]?\s*\)",
     re.IGNORECASE,
@@ -558,14 +559,51 @@ def check_pdf(
     meta = reader.metadata or {}
     title = str(meta.get("/Title") or "").strip()
     subject = str(meta.get("/Subject") or "").strip()
-    if not title and not subject:
+    # Document title = PDF /Title only. Filename must never count as the title.
+    filename = Path(urlparse(pdf_url).path).name
+    stem = Path(filename).stem.strip().lower()
+    title_norm = " ".join(title.lower().split())
+    filename_as_title = bool(
+        title_norm
+        and stem
+        and (
+            title_norm == stem
+            or title_norm == filename.lower()
+            or title_norm == f"{stem}.pdf"
+        )
+    )
+
+    if not title:
+        issues.append(
+            Issue(
+                pdf_url,
+                "pdf_missing_document_title",
+                "serious",
+                "2.4.2",
+                "PDF has no /Title metadata — document title must be set in the file, not taken from the filename",
+                pdf_url,
+            )
+        )
+    elif filename_as_title:
+        issues.append(
+            Issue(
+                pdf_url,
+                "pdf_title_is_filename",
+                "serious",
+                "2.4.2",
+                f"PDF /Title looks like the filename ({filename!r}); use a predefined human-readable document title",
+                pdf_url,
+            )
+        )
+
+    if not subject:
         issues.append(
             Issue(
                 pdf_url,
                 "pdf_missing_metadata_description",
                 "review",
                 "",
-                "PDF has no Title/Subject metadata (helpful, but NOT WCAG alternative text)",
+                "PDF has no /Subject metadata (helpful description; NOT WCAG alternative text)",
                 pdf_url,
             )
         )
