@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Crawl a domain and report WCAG-oriented accessibility signals (2.1 AA focus).
 
+Works on Windows / macOS / Linux. Shows live progress. Supports Ctrl+C checkpoint
+and `--resume` to continue later.
+
 HTML pages:
   - html[lang] (3.1.1); note when mixed scripts lack local lang (3.1.2)
   - headings: missing h1, multiple h1, skipped levels (1.3.1 / 2.4.6)
@@ -18,13 +21,14 @@ import argparse
 import csv
 import json
 import re
+import signal
 import sys
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 from urllib.parse import urldefrag, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
@@ -33,7 +37,7 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from pypdf.generic import DictionaryObject, IndirectObject
 
-USER_AGENT = "WebsiteA11yCheck/1.2 (+WCAG 2.1 AA crawl)"
+USER_AGENT = "WebsiteA11yCheck/1.3 (+WCAG 2.1 AA crawl)"
 BG_IMAGE_RE = re.compile(
     r"background(?:-image)?\s*:\s*[^;]*url\s*\(\s*[\'\"]?([^)\'\"]+)[\'\"]?\s*\)",
     re.IGNORECASE,
@@ -41,6 +45,16 @@ BG_IMAGE_RE = re.compile(
 SKIP_SCHEMES = {"mailto", "tel", "javascript", "data", "blob"}
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 LATIN_RE = re.compile(r"[A-Za-z]{3,}")
+CHECKPOINT_NAME = "checkpoint.json"
+
+
+def configure_stdio() -> None:
+    """Make Unicode status lines work on Windows consoles."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
 
 @dataclass
@@ -61,6 +75,85 @@ class CrawlReport:
     issues: list[Issue] = field(default_factory=list)
     pages: list[str] = field(default_factory=list)
     pdfs: list[str] = field(default_factory=list)
+
+
+class Progress:
+    """Thread-safe console progress for Windows and Unix terminals."""
+
+    def __init__(self, enabled: bool, max_pages: int) -> None:
+        self.enabled = enabled
+        self.max_pages = max_pages
+        self._lock = threading.Lock()
+        self.current = ""
+        self.in_flight = 0
+        self.started = time.monotonic()
+        self._last_draw = 0.0
+        self._tty = bool(getattr(sys.stderr, "isatty", lambda: False)())
+
+    def set_current(self, label: str) -> None:
+        with self._lock:
+            self.current = label
+            self._draw(force=False)
+
+    def delta_inflight(self, n: int) -> None:
+        with self._lock:
+            self.in_flight += n
+            self._draw(force=False)
+
+    def tick(self, report: CrawlReport, frontier: int, force: bool = False) -> None:
+        with self._lock:
+            self._draw(report, frontier, force=force)
+
+    def line(self, msg: str) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            if self._tty:
+                sys.stderr.write("\r" + " " * 100 + "\r")
+            sys.stderr.write(msg + "\n")
+            sys.stderr.flush()
+
+    def _draw(
+        self,
+        report: CrawlReport | None = None,
+        frontier: int = 0,
+        force: bool = False,
+    ) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_draw) < 0.15:
+            return
+        self._last_draw = now
+        if report is None:
+            return
+        elapsed = max(0.1, now - self.started)
+        rate = report.pages_crawled / elapsed
+        cur = self.current
+        if len(cur) > 48:
+            cur = cur[:45] + "..."
+        msg = (
+            f"pages {report.pages_crawled}/{self.max_pages} | "
+            f"pdfs {report.pdfs_checked} | "
+            f"issues {len(report.issues)} | "
+            f"queue {frontier} | "
+            f"inflight {self.in_flight} | "
+            f"{rate:.1f} p/s | "
+            f"{cur}"
+        )
+        if self._tty:
+            sys.stderr.write("\r" + msg[:120].ljust(120))
+            sys.stderr.flush()
+        else:
+            # non-TTY (piped / some Windows redirects): periodic full lines
+            if force or report.pages_crawled % 5 == 0:
+                sys.stderr.write(msg + "\n")
+                sys.stderr.flush()
+
+    def finish(self) -> None:
+        if self.enabled and self._tty:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
 
 def same_site(base: urlparse, other: urlparse) -> bool:
@@ -129,14 +222,12 @@ def has_accessible_name(el) -> bool:
             return True
     if visible_text(el).strip():
         return True
-    # parent with aria-label often wraps icon backgrounds
     parent = el.parent
     if parent and parent.name not in {None, "[document]", "body", "html"}:
         for attr in ("aria-label", "aria-labelledby", "title"):
             val = parent.get(attr)
             if val and str(val).strip():
                 return True
-        # short nearby text on parent
         if visible_text(parent).strip():
             return True
     return False
@@ -146,7 +237,7 @@ def check_headings(page_url: str, soup: BeautifulSoup) -> list[Issue]:
     issues: list[Issue] = []
     headings = []
     for level in range(1, 7):
-        for h in soup.find_all(f"h{level}"):
+        for _h in soup.find_all(f"h{level}"):
             headings.append(level)
 
     h1_count = sum(1 for lv in headings if lv == 1)
@@ -171,7 +262,6 @@ def check_headings(page_url: str, soup: BeautifulSoup) -> list[Issue]:
             )
         )
 
-    # skipped levels in document order
     prev = 0
     for lv in headings:
         if prev and lv > prev + 1:
@@ -184,7 +274,7 @@ def check_headings(page_url: str, soup: BeautifulSoup) -> list[Issue]:
                     f"heading jumps from h{prev} to h{lv}",
                 )
             )
-            break  # one skip note per page is enough signal
+            break
         prev = lv
     return issues
 
@@ -204,13 +294,10 @@ def check_lang(page_url: str, soup: BeautifulSoup, html: str) -> list[Issue]:
             )
         )
 
-    # mixed CJK + Latin without any local lang attributes
     sample = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)[:8000]
     has_cjk = bool(CJK_RE.search(sample))
     has_latin = bool(LATIN_RE.search(sample))
-    local_langs = soup.find_all(attrs={"lang": True})
-    # exclude the html root itself
-    local_langs = [el for el in local_langs if el.name != "html"]
+    local_langs = [el for el in soup.find_all(attrs={"lang": True}) if el.name != "html"]
     if has_cjk and has_latin and not local_langs:
         issues.append(
             Issue(
@@ -242,8 +329,8 @@ def check_html_page(
         if img.has_attr("alt"):
             alt = str(img.get("alt", ""))
             if alt.strip() == "":
-                if role == "presentation" or role == "none":
-                    continue  # explicitly decorative
+                if role in {"presentation", "none"}:
+                    continue
                 issues.append(
                     Issue(
                         page_url,
@@ -266,7 +353,6 @@ def check_html_page(
                 )
             )
 
-    # inline style background-image
     for el in soup.find_all(style=True):
         bgs = extract_bg_urls_from_css(el.get("style", ""))
         if not bgs:
@@ -296,7 +382,6 @@ def check_html_page(
                     )
                 )
 
-    # <style> blocks — cannot bind to one element; flag as review
     for style_tag in soup.find_all("style"):
         for bg in extract_bg_urls_from_css(style_tag.string or ""):
             issues.append(
@@ -421,7 +506,6 @@ def check_pdf(session: requests.Session, pdf_url: str, tmp_dir: Path) -> list[Is
         )
         return issues
 
-    # Metadata is advisory only — not a substitute for accessible alternative text
     meta = reader.metadata or {}
     title = str(meta.get("/Title") or "").strip()
     subject = str(meta.get("/Subject") or "").strip()
@@ -481,6 +565,57 @@ def check_pdf(session: requests.Session, pdf_url: str, tmp_dir: Path) -> list[Is
     return issues
 
 
+def issue_from_dict(d: dict[str, Any]) -> Issue:
+    return Issue(
+        page_url=d.get("page_url", ""),
+        kind=d.get("kind", ""),
+        severity=d.get("severity", "review"),
+        wcag=d.get("wcag", ""),
+        detail=d.get("detail", ""),
+        resource=d.get("resource", ""),
+    )
+
+
+def save_checkpoint(
+    path: Path,
+    *,
+    start_url: str,
+    report: CrawlReport,
+    seen_pages: set[str],
+    seen_pdfs: set[str],
+    pages_attempted: int,
+    frontier_pages: list[str],
+    frontier_pdfs: list[str],
+    max_pages: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "start_url": start_url,
+        "max_pages": max_pages,
+        "pages_attempted": pages_attempted,
+        "pages_crawled": report.pages_crawled,
+        "pdfs_checked": report.pdfs_checked,
+        "pages": report.pages,
+        "pdfs": report.pdfs,
+        "seen_pages": sorted(seen_pages),
+        "seen_pdfs": sorted(seen_pdfs),
+        "frontier_pages": frontier_pages,
+        "frontier_pdfs": frontier_pdfs,
+        "issues": [asdict(i) for i in report.issues],
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    tmp.replace(path)  # atomic on Windows when same volume
+
+
+def load_checkpoint(path: Path) -> dict[str, Any]:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def crawl(
     start_url: str,
     max_pages: int,
@@ -488,6 +623,9 @@ def crawl(
     respect_robots: bool,
     out_dir: Path,
     workers: int = 1,
+    show_progress: bool = True,
+    resume: bool = False,
+    checkpoint_every: int = 10,
 ) -> CrawlReport:
     start_url = normalize_url(start_url)
     base = urlparse(start_url)
@@ -495,6 +633,11 @@ def crawl(
         raise SystemExit(f"Need an http(s) start URL, got: {start_url}")
 
     workers = max(1, int(workers))
+    checkpoint_path = out_dir / CHECKPOINT_NAME
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pdf_tmp = out_dir / "pdf_cache"
+    pdf_tmp.mkdir(parents=True, exist_ok=True)
+
     bootstrap = requests.Session()
     bootstrap.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
     robots = resolve_robots(bootstrap, base) if respect_robots else None
@@ -506,8 +649,38 @@ def crawl(
     seen_pages: set[str] = set()
     seen_pdfs: set[str] = set()
     pages_attempted = 0
-    pdf_tmp = out_dir / "pdf_cache"
-    pdf_tmp.mkdir(parents=True, exist_ok=True)
+    stop = threading.Event()
+    in_flight_pages: set[str] = set()
+    in_flight_pdfs: set[str] = set()
+    pending_pages: set[str] = set()
+    pending_pdfs: set[str] = set()
+    progress = Progress(show_progress, max_pages)
+
+    if resume and checkpoint_path.is_file():
+        data = load_checkpoint(checkpoint_path)
+        ck_start = normalize_url(data.get("start_url", ""))
+        if ck_start and ck_start != start_url:
+            raise SystemExit(
+                f"Checkpoint start_url {ck_start!r} != {start_url!r}. "
+                "Use the same URL or delete checkpoint.json."
+            )
+        report.pages = list(data.get("pages", []))
+        report.pdfs = list(data.get("pdfs", []))
+        report.pages_crawled = int(data.get("pages_crawled", 0))
+        report.pdfs_checked = int(data.get("pdfs_checked", 0))
+        report.issues = [issue_from_dict(i) for i in data.get("issues", [])]
+        seen_pages = set(data.get("seen_pages", []))
+        seen_pdfs = set(data.get("seen_pdfs", []))
+        pages_attempted = int(data.get("pages_attempted", 0))
+        pending_pages = set(data.get("frontier_pages", []))
+        pending_pdfs = set(data.get("frontier_pdfs", []))
+        progress.line(
+            f"Resumed checkpoint: {report.pages_crawled} pages, "
+            f"{report.pdfs_checked} PDFs, {len(report.issues)} issues, "
+            f"{len(pending_pages)} pages queued"
+        )
+    else:
+        pending_pages.add(start_url)
 
     def throttle() -> None:
         nonlocal last_request
@@ -523,107 +696,257 @@ def crawl(
         s.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
         return s
 
+    def frontier_counts() -> tuple[int, int]:
+        with lock:
+            return len(pending_pages) + len(in_flight_pages), len(pending_pdfs) + len(
+                in_flight_pdfs
+            )
+
+    def snapshot_frontier() -> tuple[list[str], list[str]]:
+        with lock:
+            pages = sorted(pending_pages | in_flight_pages)
+            pdfs = sorted(pending_pdfs | in_flight_pdfs)
+            return pages, pdfs
+
+    def persist(reason: str) -> None:
+        fp, fpdf = snapshot_frontier()
+        with lock:
+            save_checkpoint(
+                checkpoint_path,
+                start_url=start_url,
+                report=report,
+                seen_pages=set(seen_pages),
+                seen_pdfs=set(seen_pdfs),
+                pages_attempted=pages_attempted,
+                frontier_pages=fp,
+                frontier_pdfs=fpdf,
+                max_pages=max_pages,
+            )
+        progress.line(f"Checkpoint saved ({reason}): {checkpoint_path}")
+
+    def request_stop(signum=None, frame=None) -> None:  # noqa: ANN001
+        if not stop.is_set():
+            progress.line("Interrupt received — finishing in-flight work, then saving…")
+            stop.set()
+
+    # Ctrl+C / Ctrl+Break on Windows
+    signal.signal(signal.SIGINT, request_stop)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, request_stop)  # type: ignore[attr-defined]
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, request_stop)
+
     def claim_page(url: str) -> bool:
-        """Return True if this worker should fetch the URL as a page candidate."""
         nonlocal pages_attempted
         with lock:
-            if url in seen_pages:
+            if stop.is_set():
                 return False
-            if pages_attempted >= max_pages:
+            if url in seen_pages and url not in in_flight_pages:
+                # already completed (seen and not currently in flight reclaim)
+                if url not in pending_pages:
+                    return False
+            if pages_attempted >= max_pages and url not in in_flight_pages:
+                # allow in-flight reclaim after interrupt? keep simple: block new
+                if url not in seen_pages:
+                    return False
+            pending_pages.discard(url)
+            if url in seen_pages and url not in in_flight_pages:
+                # completed page
                 return False
-            seen_pages.add(url)
-            pages_attempted += 1
+            if url not in seen_pages:
+                seen_pages.add(url)
+                pages_attempted += 1
+            in_flight_pages.add(url)
             return True
+
+    def finish_page_claim(url: str, success_html: bool) -> None:
+        with lock:
+            in_flight_pages.discard(url)
+            if not success_html and stop.is_set():
+                # put back for resume if we didn't finish HTML analysis
+                pending_pages.add(url)
+                seen_pages.discard(url)
+                # pages_attempted stays — approximate; recalculate optional
 
     def claim_pdf(url: str) -> bool:
         with lock:
-            if url in seen_pdfs:
+            if stop.is_set() and url not in in_flight_pdfs:
+                pending_pdfs.add(url)
                 return False
+            if url in seen_pdfs and url not in in_flight_pdfs:
+                pending_pdfs.discard(url)
+                return False
+            pending_pdfs.discard(url)
             seen_pdfs.add(url)
-            report.pdfs.append(url)
+            if url not in report.pdfs:
+                report.pdfs.append(url)
+            in_flight_pdfs.add(url)
             return True
 
-    def enqueue_links(links: set[str], pdfs: set[str], submit_page, submit_pdf) -> None:
-        for link in sorted(links):
-            with lock:
-                already = link in seen_pages
-                at_cap = pages_attempted >= max_pages
-            if not already and not at_cap:
-                submit_page(link)
-        for pdf in sorted(pdfs):
-            with lock:
-                already = pdf in seen_pdfs
-            if not already:
-                submit_pdf(pdf)
+    def finish_pdf_claim(url: str, done: bool) -> None:
+        with lock:
+            in_flight_pdfs.discard(url)
+            if not done:
+                pending_pdfs.add(url)
+                seen_pdfs.discard(url)
+                if url in report.pdfs:
+                    report.pdfs.remove(url)
 
     def process_page(url: str) -> tuple[set[str], set[str]]:
         if not claim_page(url):
             return set(), set()
-
-        if robots and not robots.can_fetch(USER_AGENT, url):
-            with lock:
-                report.issues.append(
-                    Issue(url, "robots_blocked", "review", "", "blocked by robots.txt")
-                )
-            return set(), set()
-
-        session = make_session()
-        throttle()
-        resp = fetch(session, url)
-        if resp is None:
-            with lock:
-                report.issues.append(
-                    Issue(url, "fetch_failed", "moderate", "", "could not fetch page")
-                )
-            return set(), set()
-
-        final_url = normalize_url(resp.url)
-        ctype = resp.headers.get("Content-Type", "")
-        with lock:
-            seen_pages.add(final_url)
-
-        if is_pdf_url(final_url, ctype):
-            # redirected to PDF
-            if claim_pdf(final_url):
-                throttle()
-                pdf_issues = check_pdf(session, final_url, pdf_tmp)
+        progress.delta_inflight(1)
+        progress.set_current(f"GET {url}")
+        ok = False
+        try:
+            if robots and not robots.can_fetch(USER_AGENT, url):
                 with lock:
-                    report.issues.extend(pdf_issues)
-                    report.pdfs_checked += 1
-            return set(), set()
+                    report.issues.append(
+                        Issue(url, "robots_blocked", "review", "", "blocked by robots.txt")
+                    )
+                ok = True
+                return set(), set()
 
-        if "html" not in ctype.lower() and not final_url.endswith((".html", ".htm", "/")):
-            return set(), set()
+            session = make_session()
+            throttle()
+            if stop.is_set():
+                return set(), set()
+            resp = fetch(session, url)
+            if resp is None:
+                with lock:
+                    report.issues.append(
+                        Issue(url, "fetch_failed", "moderate", "", "could not fetch page")
+                    )
+                ok = True
+                return set(), set()
 
-        page_issues, links, pdfs = check_html_page(final_url, resp.text, base)
-        with lock:
-            report.pages.append(final_url)
-            report.pages_crawled += 1
-            report.issues.extend(page_issues)
-        return links, pdfs
+            final_url = normalize_url(resp.url)
+            ctype = resp.headers.get("Content-Type", "")
+            with lock:
+                seen_pages.add(final_url)
+
+            if is_pdf_url(final_url, ctype):
+                if claim_pdf(final_url):
+                    progress.set_current(f"PDF {final_url}")
+                    throttle()
+                    pdf_ok = False
+                    try:
+                        pdf_issues = check_pdf(session, final_url, pdf_tmp)
+                        with lock:
+                            report.issues.extend(pdf_issues)
+                            report.pdfs_checked += 1
+                        pdf_ok = True
+                    finally:
+                        finish_pdf_claim(final_url, pdf_ok)
+                ok = True
+                return set(), set()
+
+            if "html" not in ctype.lower() and not final_url.endswith(
+                (".html", ".htm", "/")
+            ):
+                ok = True
+                return set(), set()
+
+            page_issues, links, pdfs = check_html_page(final_url, resp.text, base)
+            with lock:
+                if final_url not in report.pages:
+                    report.pages.append(final_url)
+                    report.pages_crawled += 1
+                report.issues.extend(page_issues)
+            ok = True
+            return links, pdfs
+        finally:
+            finish_page_claim(url, ok)
+            progress.delta_inflight(-1)
+            fp, _ = frontier_counts()
+            with lock:
+                progress.tick(report, fp)
 
     def process_pdf(url: str) -> tuple[set[str], set[str]]:
         if not claim_pdf(url):
             return set(), set()
-        session = make_session()
-        throttle()
-        pdf_issues = check_pdf(session, url, pdf_tmp)
-        with lock:
-            report.issues.extend(pdf_issues)
-            report.pdfs_checked += 1
-        return set(), set()
+        progress.delta_inflight(1)
+        progress.set_current(f"PDF {url}")
+        done = False
+        try:
+            session = make_session()
+            throttle()
+            if stop.is_set():
+                return set(), set()
+            pdf_issues = check_pdf(session, url, pdf_tmp)
+            with lock:
+                report.issues.extend(pdf_issues)
+                report.pdfs_checked += 1
+            done = True
+            return set(), set()
+        finally:
+            finish_pdf_claim(url, done)
+            progress.delta_inflight(-1)
+            fp, _ = frontier_counts()
+            with lock:
+                progress.tick(report, fp)
+
+    interrupted = False
+    completed_since_ckpt = 0
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="a11y") as pool:
-        futures = set()
+        futures: set = set()
 
         def submit_page(u: str) -> None:
+            with lock:
+                if stop.is_set():
+                    pending_pages.add(u)
+                    return
+                if u in seen_pages and u not in in_flight_pages and u not in pending_pages:
+                    return
+                pending_pages.add(u)
             futures.add(pool.submit(process_page, u))
 
         def submit_pdf(u: str) -> None:
+            with lock:
+                if stop.is_set():
+                    pending_pdfs.add(u)
+                    return
+                if u in seen_pdfs and u not in in_flight_pdfs:
+                    return
+                pending_pdfs.add(u)
             futures.add(pool.submit(process_pdf, u))
 
-        submit_page(start_url)
+        for u in sorted(pending_pages):
+            submit_page(u)
+        for u in sorted(pending_pdfs):
+            submit_pdf(u)
+        pending_pages.clear()
+        pending_pdfs.clear()
+
+        progress.line(
+            f"Crawl start: {start_url} | workers={workers} | max_pages={max_pages} | delay={delay}s"
+        )
+
         while futures:
+            if stop.is_set():
+                interrupted = True
+                # let in-flight finish; do not submit new from results
+                done, futures = wait(futures, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    try:
+                        fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        with lock:
+                            report.issues.append(
+                                Issue(
+                                    start_url,
+                                    "worker_error",
+                                    "moderate",
+                                    "",
+                                    f"worker failed: {exc}",
+                                )
+                            )
+                # cancel remaining if any still queued in executor
+                for fut in list(futures):
+                    fut.cancel()
+                break
+
             done, futures = wait(futures, return_when=FIRST_COMPLETED)
             for fut in done:
                 try:
@@ -640,8 +963,51 @@ def crawl(
                             )
                         )
                     continue
-                enqueue_links(links, pdfs, submit_page, submit_pdf)
+                completed_since_ckpt += 1
+                if not stop.is_set():
+                    for link in sorted(links):
+                        with lock:
+                            already = link in seen_pages or link in in_flight_pages
+                            at_cap = pages_attempted >= max_pages
+                        if not already and not at_cap:
+                            submit_page(link)
+                    for pdf in sorted(pdfs):
+                        with lock:
+                            already = pdf in seen_pdfs or pdf in in_flight_pdfs
+                        if not already:
+                            submit_pdf(pdf)
+                else:
+                    with lock:
+                        pending_pages.update(links)
+                        pending_pdfs.update(pdfs)
 
+                if checkpoint_every > 0 and completed_since_ckpt >= checkpoint_every:
+                    persist("periodic")
+                    completed_since_ckpt = 0
+
+            fp, _ = frontier_counts()
+            with lock:
+                progress.tick(report, fp, force=True)
+
+    progress.finish()
+
+    if interrupted or stop.is_set():
+        persist("interrupt")
+        write_outputs(report, out_dir)
+        progress.line(
+            f"Interrupted. Partial report written. Resume with:\n"
+            f"  python a11y_crawl.py {start_url} -o {out_dir} --resume"
+        )
+        return report
+
+    # successful completion: write outputs and clear checkpoint
+    write_outputs(report, out_dir)
+    if checkpoint_path.exists():
+        try:
+            checkpoint_path.unlink()
+            progress.line("Checkpoint cleared (crawl finished).")
+        except OSError:
+            pass
     return report
 
 
@@ -651,7 +1017,7 @@ def write_outputs(report: CrawlReport, out_dir: Path) -> None:
     csv_path = out_dir / "issues.csv"
     summary_path = out_dir / "summary.txt"
 
-    with open(json_path, "w", encoding="utf-8") as f:
+    with open(json_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(
             {
                 "start_url": report.start_url,
@@ -695,12 +1061,12 @@ def write_outputs(report: CrawlReport, out_dir: Path) -> None:
     lines.append("By kind:")
     for k, v in sorted(by_kind.items(), key=lambda kv: (-kv[1], kv[0])):
         lines.append(f"  {k}: {v}")
-    summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Crawl a site and check WCAG-oriented a11y signals"
+        description="Crawl a site and check WCAG-oriented a11y signals (Windows-friendly)"
     )
     p.add_argument("start_url", help="https://example.com/")
     p.add_argument("--max-pages", type=int, default=200)
@@ -713,10 +1079,27 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--no-robots", action="store_true", help="ignore robots.txt")
     p.add_argument("-o", "--out", default="a11y_report", help="output directory")
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help=f"continue from {CHECKPOINT_NAME} in the output directory",
+    )
+    p.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=10,
+        help="save checkpoint every N completed tasks (0 = only on interrupt)",
+    )
+    p.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="disable live progress status on stderr",
+    )
     return p.parse_args(list(argv) if argv is not None else None)
 
 
 def main(argv: Iterable[str] | None = None) -> int:
+    configure_stdio()
     args = parse_args(argv)
     out_dir = Path(args.out)
     report = crawl(
@@ -726,14 +1109,20 @@ def main(argv: Iterable[str] | None = None) -> int:
         respect_robots=not args.no_robots,
         out_dir=out_dir,
         workers=args.workers,
+        show_progress=not args.no_progress,
+        resume=args.resume,
+        checkpoint_every=args.checkpoint_every,
     )
-    write_outputs(report, out_dir)
     print(f"Crawled {report.pages_crawled} pages, {report.pdfs_checked} PDFs")
     print(f"Found {len(report.issues)} issues")
     print(f"Wrote {out_dir / 'summary.txt'}, issues.csv, report.json")
     return 0
 
 
-
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # fallback if signal handler did not run yet
+        sys.stderr.write("\nInterrupted.\n")
+        sys.exit(130)
