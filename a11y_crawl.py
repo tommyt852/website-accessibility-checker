@@ -37,7 +37,7 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from pypdf.generic import DictionaryObject, IndirectObject
 
-USER_AGENT = "WebsiteA11yCheck/1.3 (+WCAG 2.1 AA crawl)"
+USER_AGENT = "WebsiteA11yCheck/1.4 (+WCAG 2.1 AA crawl)"
 BG_IMAGE_RE = re.compile(
     r"background(?:-image)?\s*:\s*[^;]*url\s*\(\s*[\'\"]?([^)\'\"]+)[\'\"]?\s*\)",
     re.IGNORECASE,
@@ -68,11 +68,23 @@ class Issue:
 
 
 @dataclass
+class AccessError:
+    """Failed to open/download/parse a page or PDF (separate from a11y issues)."""
+    url: str
+    resource_type: str  # page | pdf
+    error_type: str  # http_error | timeout | connection | robots | save | parse | unknown
+    message: str
+    status_code: int | None = None
+    final_url: str = ""
+
+
+@dataclass
 class CrawlReport:
     start_url: str
     pages_crawled: int = 0
     pdfs_checked: int = 0
     issues: list[Issue] = field(default_factory=list)
+    access_errors: list[AccessError] = field(default_factory=list)
     pages: list[str] = field(default_factory=list)
     pdfs: list[str] = field(default_factory=list)
 
@@ -136,6 +148,7 @@ class Progress:
             f"pages {report.pages_crawled}/{self.max_pages} | "
             f"pdfs {report.pdfs_checked} | "
             f"issues {len(report.issues)} | "
+            f"errors {len(report.access_errors)} | "
             f"queue {frontier} | "
             f"inflight {self.in_flight} | "
             f"{rate:.1f} p/s | "
@@ -198,15 +211,45 @@ def resolve_robots(session: requests.Session, start: urlparse) -> RobotFileParse
 
 
 def fetch(
-    session: requests.Session, url: str, stream: bool = False
-) -> requests.Response | None:
+    session: requests.Session,
+    url: str,
+    *,
+    resource_type: str = "page",
+    stream: bool = False,
+) -> tuple[requests.Response | None, AccessError | None]:
     try:
         resp = session.get(url, timeout=25, allow_redirects=True, stream=stream)
         if resp.status_code >= 400:
-            return None
-        return resp
-    except requests.RequestException:
-        return None
+            return None, AccessError(
+                url=url,
+                resource_type=resource_type,
+                error_type="http_error",
+                message=f"HTTP {resp.status_code}",
+                status_code=resp.status_code,
+                final_url=str(resp.url),
+            )
+        return resp, None
+    except requests.Timeout as exc:
+        return None, AccessError(
+            url=url,
+            resource_type=resource_type,
+            error_type="timeout",
+            message=str(exc) or "request timed out",
+        )
+    except requests.ConnectionError as exc:
+        return None, AccessError(
+            url=url,
+            resource_type=resource_type,
+            error_type="connection",
+            message=str(exc) or "connection failed",
+        )
+    except requests.RequestException as exc:
+        return None, AccessError(
+            url=url,
+            resource_type=resource_type,
+            error_type="unknown",
+            message=str(exc) or "request failed",
+        )
 
 
 def visible_text(el) -> str:
@@ -452,29 +495,30 @@ def collect_pdf_alts(obj, seen: set[int], alts: list[str]) -> None:
             collect_pdf_alts(item, seen, alts)
 
 
-def check_pdf(session: requests.Session, pdf_url: str, tmp_dir: Path) -> list[Issue]:
+def check_pdf(
+    session: requests.Session, pdf_url: str, tmp_dir: Path
+) -> tuple[list[Issue], list[AccessError]]:
     issues: list[Issue] = []
-    resp = fetch(session, pdf_url, stream=True)
-    if resp is None:
-        issues.append(
-            Issue(pdf_url, "pdf_fetch_failed", "moderate", "", "could not download PDF", pdf_url)
-        )
-        return issues
+    access_errors: list[AccessError] = []
+    resp, err = fetch(session, pdf_url, resource_type="pdf", stream=True)
+    if err is not None:
+        access_errors.append(err)
+        return issues, access_errors
+    assert resp is not None
 
     ctype = resp.headers.get("Content-Type", "")
     if not is_pdf_url(pdf_url, ctype) and "pdf" not in ctype.lower():
         if not pdf_url.lower().endswith(".pdf"):
-            issues.append(
-                Issue(
-                    pdf_url,
-                    "pdf_not_pdf",
-                    "review",
-                    "",
-                    f"URL does not look like PDF ({ctype})",
-                    pdf_url,
+            access_errors.append(
+                AccessError(
+                    url=pdf_url,
+                    resource_type="pdf",
+                    error_type="not_pdf",
+                    message=f"URL does not look like PDF ({ctype})",
+                    final_url=str(resp.url),
                 )
             )
-            return issues
+            return issues, access_errors
 
     safe_name = re.sub(r"[^\w.-]+", "_", urlparse(pdf_url).path.strip("/")) or "doc.pdf"
     if not safe_name.lower().endswith(".pdf"):
@@ -486,25 +530,30 @@ def check_pdf(session: requests.Session, pdf_url: str, tmp_dir: Path) -> list[Is
                 if chunk:
                     f.write(chunk)
     except OSError as exc:
-        issues.append(
-            Issue(pdf_url, "pdf_save_failed", "moderate", "", str(exc), pdf_url)
+        access_errors.append(
+            AccessError(
+                url=pdf_url,
+                resource_type="pdf",
+                error_type="save",
+                message=str(exc),
+                final_url=str(resp.url),
+            )
         )
-        return issues
+        return issues, access_errors
 
     try:
         reader = PdfReader(str(path))
     except Exception as exc:  # noqa: BLE001
-        issues.append(
-            Issue(
-                pdf_url,
-                "pdf_parse_failed",
-                "moderate",
-                "",
-                f"cannot parse PDF: {exc}",
-                pdf_url,
+        access_errors.append(
+            AccessError(
+                url=pdf_url,
+                resource_type="pdf",
+                error_type="parse",
+                message=f"cannot parse PDF: {exc}",
+                final_url=str(resp.url),
             )
         )
-        return issues
+        return issues, access_errors
 
     meta = reader.metadata or {}
     title = str(meta.get("/Title") or "").strip()
@@ -562,7 +611,8 @@ def check_pdf(session: requests.Session, pdf_url: str, tmp_dir: Path) -> list[Is
             )
         )
 
-    return issues
+    return issues, access_errors
+
 
 
 def issue_from_dict(d: dict[str, Any]) -> Issue:
@@ -573,6 +623,17 @@ def issue_from_dict(d: dict[str, Any]) -> Issue:
         wcag=d.get("wcag", ""),
         detail=d.get("detail", ""),
         resource=d.get("resource", ""),
+    )
+
+
+def access_error_from_dict(d: dict[str, Any]) -> AccessError:
+    return AccessError(
+        url=d.get("url", ""),
+        resource_type=d.get("resource_type", "page"),
+        error_type=d.get("error_type", "unknown"),
+        message=d.get("message", ""),
+        status_code=d.get("status_code"),
+        final_url=d.get("final_url", ""),
     )
 
 
@@ -603,6 +664,7 @@ def save_checkpoint(
         "frontier_pages": frontier_pages,
         "frontier_pdfs": frontier_pdfs,
         "issues": [asdict(i) for i in report.issues],
+        "access_errors": [asdict(e) for e in report.access_errors],
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     tmp = path.with_suffix(".tmp")
@@ -669,6 +731,9 @@ def crawl(
         report.pages_crawled = int(data.get("pages_crawled", 0))
         report.pdfs_checked = int(data.get("pdfs_checked", 0))
         report.issues = [issue_from_dict(i) for i in data.get("issues", [])]
+        report.access_errors = [
+            access_error_from_dict(e) for e in data.get("access_errors", [])
+        ]
         seen_pages = set(data.get("seen_pages", []))
         seen_pdfs = set(data.get("seen_pdfs", []))
         pages_attempted = int(data.get("pages_attempted", 0))
@@ -677,6 +742,7 @@ def crawl(
         progress.line(
             f"Resumed checkpoint: {report.pages_crawled} pages, "
             f"{report.pdfs_checked} PDFs, {len(report.issues)} issues, "
+            f"{len(report.access_errors)} access errors, "
             f"{len(pending_pages)} pages queued"
         )
     else:
@@ -801,8 +867,13 @@ def crawl(
         try:
             if robots and not robots.can_fetch(USER_AGENT, url):
                 with lock:
-                    report.issues.append(
-                        Issue(url, "robots_blocked", "review", "", "blocked by robots.txt")
+                    report.access_errors.append(
+                        AccessError(
+                            url=url,
+                            resource_type="page",
+                            error_type="robots",
+                            message="blocked by robots.txt",
+                        )
                     )
                 ok = True
                 return set(), set()
@@ -811,14 +882,13 @@ def crawl(
             throttle()
             if stop.is_set():
                 return set(), set()
-            resp = fetch(session, url)
-            if resp is None:
+            resp, err = fetch(session, url, resource_type="page")
+            if err is not None:
                 with lock:
-                    report.issues.append(
-                        Issue(url, "fetch_failed", "moderate", "", "could not fetch page")
-                    )
+                    report.access_errors.append(err)
                 ok = True
                 return set(), set()
+            assert resp is not None
 
             final_url = normalize_url(resp.url)
             ctype = resp.headers.get("Content-Type", "")
@@ -831,9 +901,10 @@ def crawl(
                     throttle()
                     pdf_ok = False
                     try:
-                        pdf_issues = check_pdf(session, final_url, pdf_tmp)
+                        pdf_issues, pdf_errs = check_pdf(session, final_url, pdf_tmp)
                         with lock:
                             report.issues.extend(pdf_issues)
+                            report.access_errors.extend(pdf_errs)
                             report.pdfs_checked += 1
                         pdf_ok = True
                     finally:
@@ -873,9 +944,10 @@ def crawl(
             throttle()
             if stop.is_set():
                 return set(), set()
-            pdf_issues = check_pdf(session, url, pdf_tmp)
+            pdf_issues, pdf_errs = check_pdf(session, url, pdf_tmp)
             with lock:
                 report.issues.extend(pdf_issues)
+                report.access_errors.extend(pdf_errs)
                 report.pdfs_checked += 1
             done = True
             return set(), set()
@@ -1016,6 +1088,9 @@ def write_outputs(report: CrawlReport, out_dir: Path) -> None:
     json_path = out_dir / "report.json"
     csv_path = out_dir / "issues.csv"
     summary_path = out_dir / "summary.txt"
+    errors_csv = out_dir / "errors.csv"
+    errors_json = out_dir / "error_report.json"
+    errors_txt = out_dir / "error_report.txt"
 
     with open(json_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(
@@ -1026,6 +1101,7 @@ def write_outputs(report: CrawlReport, out_dir: Path) -> None:
                 "pages": report.pages,
                 "pdfs": report.pdfs,
                 "issues": [asdict(i) for i in report.issues],
+                "access_errors": [asdict(e) for e in report.access_errors],
             },
             f,
             ensure_ascii=False,
@@ -1039,6 +1115,58 @@ def write_outputs(report: CrawlReport, out_dir: Path) -> None:
         for i in report.issues:
             w.writerow(asdict(i))
 
+    err_fields = [
+        "url",
+        "resource_type",
+        "error_type",
+        "status_code",
+        "message",
+        "final_url",
+    ]
+    with open(errors_csv, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=err_fields)
+        w.writeheader()
+        for e in report.access_errors:
+            w.writerow(asdict(e))
+
+    with open(errors_json, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(
+            {
+                "start_url": report.start_url,
+                "error_count": len(report.access_errors),
+                "errors": [asdict(e) for e in report.access_errors],
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    by_type: dict[str, int] = {}
+    by_res: dict[str, int] = {}
+    err_lines = [
+        f"Access error report for: {report.start_url}",
+        f"Total access errors: {len(report.access_errors)}",
+        "",
+    ]
+    for e in report.access_errors:
+        by_type[e.error_type] = by_type.get(e.error_type, 0) + 1
+        by_res[e.resource_type] = by_res.get(e.resource_type, 0) + 1
+    err_lines.append("By resource type:")
+    for k, v in sorted(by_res.items()):
+        err_lines.append(f"  {k}: {v}")
+    err_lines.append("")
+    err_lines.append("By error type:")
+    for k, v in sorted(by_type.items(), key=lambda kv: (-kv[1], kv[0])):
+        err_lines.append(f"  {k}: {v}")
+    err_lines.append("")
+    err_lines.append("Details:")
+    for e in report.access_errors:
+        code = f" HTTP {e.status_code}" if e.status_code else ""
+        err_lines.append(
+            f"- [{e.resource_type}/{e.error_type}]{code} {e.url} — {e.message}"
+        )
+    errors_txt.write_text("\n".join(err_lines) + "\n", encoding="utf-8", newline="\n")
+
     by_sev: dict[str, int] = {}
     by_kind: dict[str, int] = {}
     for i in report.issues:
@@ -1051,6 +1179,7 @@ def write_outputs(report: CrawlReport, out_dir: Path) -> None:
         f"Pages crawled: {report.pages_crawled}",
         f"PDFs checked: {report.pdfs_checked}",
         f"Issues: {len(report.issues)}",
+        f"Access errors: {len(report.access_errors)}",
         "",
         "By severity:",
     ]
@@ -1061,6 +1190,11 @@ def write_outputs(report: CrawlReport, out_dir: Path) -> None:
     lines.append("By kind:")
     for k, v in sorted(by_kind.items(), key=lambda kv: (-kv[1], kv[0])):
         lines.append(f"  {k}: {v}")
+    if report.access_errors:
+        lines.append("")
+        lines.append(
+            f"See error_report.txt / errors.csv for {len(report.access_errors)} failed page/PDF accesses."
+        )
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
@@ -1114,8 +1248,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         checkpoint_every=args.checkpoint_every,
     )
     print(f"Crawled {report.pages_crawled} pages, {report.pdfs_checked} PDFs")
-    print(f"Found {len(report.issues)} issues")
-    print(f"Wrote {out_dir / 'summary.txt'}, issues.csv, report.json")
+    print(f"Found {len(report.issues)} issues, {len(report.access_errors)} access errors")
+    print(
+        f"Wrote {out_dir / 'summary.txt'}, issues.csv, report.json, "
+        f"error_report.txt, errors.csv"
+    )
     return 0
 
 
