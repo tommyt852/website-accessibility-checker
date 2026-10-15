@@ -26,6 +26,7 @@ import signal
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -38,7 +39,7 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from pypdf.generic import DictionaryObject, IndirectObject
 
-USER_AGENT = "WebsiteA11yCheck/1.5 (+WCAG 2.1 AA crawl)"
+USER_AGENT = "WebsiteA11yCheck/1.6 (+WCAG 2.1 AA crawl)"
 BG_IMAGE_RE = re.compile(
     r"background(?:-image)?\s*:\s*[^;]*url\s*\(\s*[\'\"]?([^)\'\"]+)[\'\"]?\s*\)",
     re.IGNORECASE,
@@ -716,6 +717,115 @@ def load_checkpoint(path: Path) -> dict[str, Any]:
         return json.load(f)
 
 
+def _local_name(tag: str) -> str:
+    if "}" in tag:
+        return tag.rsplit("}", 1)[-1]
+    return tag
+
+
+def parse_sitemap_xml(content: bytes | str, base: urlparse) -> tuple[set[str], set[str]]:
+    """Return (page_urls, child_sitemap_urls) from a sitemap or sitemap index."""
+    pages: set[str] = set()
+    children: set[str] = set()
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return pages, children
+
+    root_name = _local_name(root.tag).lower()
+    for node in root:
+        node_name = _local_name(node.tag).lower()
+        loc_text = None
+        for child in node.iter():
+            if _local_name(child.tag).lower() == "loc" and child.text:
+                loc_text = child.text.strip()
+                break
+        if not loc_text:
+            continue
+        loc = normalize_url(loc_text)
+        if not same_site(base, urlparse(loc)):
+            continue
+        if root_name == "sitemapindex" or node_name == "sitemap":
+            children.add(loc)
+        else:
+            pages.add(loc)
+
+    # fallback: any <loc> under root
+    if not pages and not children:
+        for el in root.iter():
+            if _local_name(el.tag).lower() != "loc" or not el.text:
+                continue
+            loc = normalize_url(el.text.strip())
+            if not same_site(base, urlparse(loc)):
+                continue
+            if root_name == "sitemapindex":
+                children.add(loc)
+            else:
+                pages.add(loc)
+    return pages, children
+
+
+def discover_sitemap_urls(
+    session: requests.Session,
+    base: urlparse,
+    *,
+    max_sitemaps: int = 20,
+    progress: Progress | None = None,
+) -> set[str]:
+    """Collect same-site URLs from robots.txt Sitemap: lines and /sitemap.xml."""
+    candidates: list[str] = []
+    robots_url = f"{base.scheme}://{base.netloc}/robots.txt"
+    try:
+        resp = session.get(robots_url, timeout=15)
+        if resp.status_code < 400:
+            for line in resp.text.splitlines():
+                if line.lower().startswith("sitemap:"):
+                    sm = line.split(":", 1)[1].strip()
+                    if sm:
+                        candidates.append(normalize_url(sm))
+    except requests.RequestException:
+        pass
+
+    default_sm = f"{base.scheme}://{base.netloc}/sitemap.xml"
+    if default_sm not in candidates:
+        candidates.append(default_sm)
+
+    found: set[str] = set()
+    seen_sitemaps: set[str] = set()
+    queue = list(dict.fromkeys(candidates))
+
+    while queue and len(seen_sitemaps) < max_sitemaps:
+        sm_url = queue.pop(0)
+        if sm_url in seen_sitemaps:
+            continue
+        if not same_site(base, urlparse(sm_url)):
+            continue
+        seen_sitemaps.add(sm_url)
+        try:
+            resp = session.get(sm_url, timeout=20)
+        except requests.RequestException:
+            continue
+        if resp.status_code >= 400:
+            continue
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if "html" in ctype and "xml" not in ctype and not sm_url.lower().endswith(
+            (".xml", ".xml.gz")
+        ):
+            continue
+        pages, children = parse_sitemap_xml(resp.content, base)
+        found.update(pages)
+        for child in sorted(children):
+            if child not in seen_sitemaps:
+                queue.append(child)
+        if progress is not None:
+            progress.line(
+                f"Sitemap {sm_url}: +{len(pages)} urls ({len(children)} child sitemaps)"
+            )
+
+    return found
+
+
+
 def crawl(
     start_url: str,
     max_pages: int,
@@ -726,6 +836,7 @@ def crawl(
     show_progress: bool = True,
     resume: bool = False,
     checkpoint_every: int = 10,
+    use_sitemap: bool = True,
 ) -> CrawlReport:
     start_url = normalize_url(start_url)
     base = urlparse(start_url)
@@ -785,6 +896,18 @@ def crawl(
         )
     else:
         pending_pages.add(start_url)
+        if use_sitemap:
+            sm_urls = discover_sitemap_urls(bootstrap, base, progress=progress)
+            for u in sm_urls:
+                if is_pdf_url(u):
+                    pending_pdfs.add(u)
+                else:
+                    pending_pages.add(u)
+            progress.line(
+                f"Sitemap seed total: {len(sm_urls)} urls "
+                f"→ queue {len(pending_pages)} pages, {len(pending_pdfs)} PDFs "
+                f"(still capped by --max-pages)"
+            )
 
     def throttle() -> None:
         nonlocal last_request
@@ -1267,6 +1390,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="disable live progress status on stderr",
     )
+    p.add_argument(
+        "--no-sitemap",
+        action="store_true",
+        help="do not seed URLs from sitemap.xml / robots.txt Sitemap:",
+    )
     return p.parse_args(list(argv) if argv is not None else None)
 
 
@@ -1284,6 +1412,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         show_progress=not args.no_progress,
         resume=args.resume,
         checkpoint_every=args.checkpoint_every,
+        use_sitemap=not args.no_sitemap,
     )
     print(f"Crawled {report.pages_crawled} pages, {report.pdfs_checked} PDFs")
     print(f"Found {len(report.issues)} issues, {len(report.access_errors)} access errors")

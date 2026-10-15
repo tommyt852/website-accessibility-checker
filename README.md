@@ -2,7 +2,7 @@
 
 Crawl all same-domain pages via hyperlinks and report WCAG 2.1 AA–oriented gaps.
 
-**Target OS:** Windows (also works on macOS/Linux). Live progress on the console. Ctrl+C saves a checkpoint; `--resume` continues later.
+**Target OS:** Windows (also works on macOS/Linux). Live progress on the console. Ctrl+C saves a checkpoint; `--resume` continues later. Seeds URLs from `sitemap.xml` (and robots.txt `Sitemap:`) by default for better coverage.
 
 ## Checks
 
@@ -63,6 +63,7 @@ Options:
 - `--resume` — continue from `checkpoint.json` in `-o`
 - `--checkpoint-every 10` — periodic save (0 = only on interrupt)
 - `--no-progress` — disable stderr progress
+- `--no-sitemap` — do not seed from `sitemap.xml` / robots.txt `Sitemap:`
 - `--no-robots`
 
 Outputs:
