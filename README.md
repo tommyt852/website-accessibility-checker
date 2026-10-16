@@ -72,5 +72,5 @@ Options:
 Outputs:
 
 - `summary.txt`, `issues.csv`, `report.json` — accessibility findings
-- `error_report.txt`, `errors.csv`, `error_report.json` — pages/PDFs that failed to open (HTTP error, timeout, connection, robots, save/parse)
+- `error_report.txt`, `errors.csv`, `error_report.json` — pages/PDFs that failed to open (HTTP error, timeout, connection, robots, save/parse), including **source pages** that linked to them
 - `checkpoint.json` — only if interrupted / for `--resume`

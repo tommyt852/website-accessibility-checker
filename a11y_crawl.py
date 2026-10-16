@@ -39,7 +39,7 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from pypdf.generic import DictionaryObject, IndirectObject
 
-USER_AGENT = "WebsiteA11yCheck/1.7 (+WCAG 2.1 AA crawl)"
+USER_AGENT = "WebsiteA11yCheck/1.8 (+WCAG 2.1 AA crawl)"
 BG_IMAGE_RE = re.compile(
     r"background(?:-image)?\s*:\s*[^;]*url\s*\(\s*[\'\"]?([^)\'\"]+)[\'\"]?\s*\)",
     re.IGNORECASE,
@@ -78,6 +78,7 @@ class AccessError:
     message: str
     status_code: int | None = None
     final_url: str = ""
+    source_pages: list[str] = field(default_factory=list)  # pages that linked here
 
 
 @dataclass
@@ -743,6 +744,9 @@ def issue_from_dict(d: dict[str, Any]) -> Issue:
 
 
 def access_error_from_dict(d: dict[str, Any]) -> AccessError:
+    sources = d.get("source_pages") or []
+    if isinstance(sources, str):
+        sources = [s for s in sources.split(" | ") if s]
     return AccessError(
         url=d.get("url", ""),
         resource_type=d.get("resource_type", "page"),
@@ -750,6 +754,7 @@ def access_error_from_dict(d: dict[str, Any]) -> AccessError:
         message=d.get("message", ""),
         status_code=d.get("status_code"),
         final_url=d.get("final_url", ""),
+        source_pages=list(sources),
     )
 
 
@@ -764,6 +769,7 @@ def save_checkpoint(
     frontier_pages: list[str],
     frontier_pdfs: list[str],
     max_pages: int,
+    link_sources: dict[str, set[str]] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -781,6 +787,9 @@ def save_checkpoint(
         "frontier_pdfs": frontier_pdfs,
         "issues": [asdict(i) for i in report.issues],
         "access_errors": [asdict(e) for e in report.access_errors],
+        "link_sources": {
+            k: sorted(v) for k, v in sorted((link_sources or {}).items())
+        },
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     tmp = path.with_suffix(".tmp")
@@ -942,7 +951,21 @@ def crawl(
     in_flight_pdfs: set[str] = set()
     pending_pages: set[str] = set()
     pending_pdfs: set[str] = set()
+    link_sources: dict[str, set[str]] = {}
     progress = Progress(show_progress, max_pages)
+
+    def note_source(target: str, source: str) -> None:
+        if not target or not source:
+            return
+        link_sources.setdefault(target, set()).add(source)
+
+    def sources_for(url: str) -> list[str]:
+        return sorted(link_sources.get(url, set()))
+
+    def with_sources(err: AccessError) -> AccessError:
+        if not err.source_pages:
+            err.source_pages = sources_for(err.url)
+        return err
 
     if resume and checkpoint_path.is_file():
         data = load_checkpoint(checkpoint_path)
@@ -965,6 +988,8 @@ def crawl(
         pages_attempted = int(data.get("pages_attempted", 0))
         pending_pages = set(data.get("frontier_pages", []))
         pending_pdfs = set(data.get("frontier_pdfs", []))
+        for target, sources in (data.get("link_sources") or {}).items():
+            link_sources[target] = set(sources)
         progress.line(
             f"Resumed checkpoint: {report.pages_crawled} pages, "
             f"{report.pdfs_checked} PDFs, {len(report.issues)} issues, "
@@ -973,9 +998,11 @@ def crawl(
         )
     else:
         pending_pages.add(start_url)
+        note_source(start_url, "(start)")
         if use_sitemap:
             sm_urls = discover_sitemap_urls(bootstrap, base, progress=progress)
             for u in sm_urls:
+                note_source(u, "(sitemap)")
                 if is_pdf_url(u):
                     pending_pdfs.add(u)
                 else:
@@ -1025,6 +1052,7 @@ def crawl(
                 frontier_pages=fp,
                 frontier_pdfs=fpdf,
                 max_pages=max_pages,
+                link_sources=link_sources,
             )
         progress.line(f"Checkpoint saved ({reason}): {checkpoint_path}")
 
@@ -1106,11 +1134,13 @@ def crawl(
             if robots and not robots.can_fetch(USER_AGENT, url):
                 with lock:
                     report.access_errors.append(
-                        AccessError(
-                            url=url,
-                            resource_type="page",
-                            error_type="robots",
-                            message="blocked by robots.txt",
+                        with_sources(
+                            AccessError(
+                                url=url,
+                                resource_type="page",
+                                error_type="robots",
+                                message="blocked by robots.txt",
+                            )
                         )
                     )
                 ok = True
@@ -1123,7 +1153,7 @@ def crawl(
             resp, err = fetch(session, url, resource_type="page")
             if err is not None:
                 with lock:
-                    report.access_errors.append(err)
+                    report.access_errors.append(with_sources(err))
                 ok = True
                 return set(), set()
             assert resp is not None
@@ -1142,7 +1172,9 @@ def crawl(
                         pdf_issues, pdf_errs = check_pdf(session, final_url, pdf_tmp)
                         with lock:
                             report.issues.extend(pdf_issues)
-                            report.access_errors.extend(pdf_errs)
+                            report.access_errors.extend(
+                                with_sources(e) for e in pdf_errs
+                            )
                             report.pdfs_checked += 1
                         pdf_ok = True
                     finally:
@@ -1162,6 +1194,10 @@ def crawl(
                     report.pages.append(final_url)
                     report.pages_crawled += 1
                 report.issues.extend(page_issues)
+                for link in links:
+                    note_source(link, final_url)
+                for pdf in pdfs:
+                    note_source(pdf, final_url)
             ok = True
             return links, pdfs
         finally:
@@ -1185,7 +1221,7 @@ def crawl(
             pdf_issues, pdf_errs = check_pdf(session, url, pdf_tmp)
             with lock:
                 report.issues.extend(pdf_issues)
-                report.access_errors.extend(pdf_errs)
+                report.access_errors.extend(with_sources(e) for e in pdf_errs)
                 report.pdfs_checked += 1
             done = True
             return set(), set()
@@ -1360,12 +1396,15 @@ def write_outputs(report: CrawlReport, out_dir: Path) -> None:
         "status_code",
         "message",
         "final_url",
+        "source_pages",
     ]
     with open(errors_csv, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=err_fields)
         w.writeheader()
         for e in report.access_errors:
-            w.writerow(asdict(e))
+            row = asdict(e)
+            row["source_pages"] = " | ".join(e.source_pages)
+            w.writerow(row)
 
     with open(errors_json, "w", encoding="utf-8", newline="\n") as f:
         json.dump(
@@ -1400,9 +1439,11 @@ def write_outputs(report: CrawlReport, out_dir: Path) -> None:
     err_lines.append("Details:")
     for e in report.access_errors:
         code = f" HTTP {e.status_code}" if e.status_code else ""
+        src = ", ".join(e.source_pages) if e.source_pages else "(unknown)"
         err_lines.append(
             f"- [{e.resource_type}/{e.error_type}]{code} {e.url} — {e.message}"
         )
+        err_lines.append(f"    found on: {src}")
     errors_txt.write_text("\n".join(err_lines) + "\n", encoding="utf-8", newline="\n")
 
     by_sev: dict[str, int] = {}
