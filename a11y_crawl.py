@@ -39,7 +39,7 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from pypdf.generic import DictionaryObject, IndirectObject
 
-USER_AGENT = "WebsiteA11yCheck/1.8 (+WCAG 2.1 AA crawl)"
+USER_AGENT = "WebsiteA11yCheck/1.10 (+WCAG 2.1 AA crawl)"
 BG_IMAGE_RE = re.compile(
     r"background(?:-image)?\s*:\s*[^;]*url\s*\(\s*[\'\"]?([^)\'\"]+)[\'\"]?\s*\)",
     re.IGNORECASE,
@@ -70,6 +70,14 @@ class Issue:
 
 
 @dataclass
+class SourceRef:
+    """Where a failed URL was discovered."""
+    page_url: str
+    href: str = ""  # original attribute value when known
+    link_text: str = ""
+
+
+@dataclass
 class AccessError:
     """Failed to open/download/parse a page or PDF (separate from a11y issues)."""
     url: str
@@ -79,6 +87,7 @@ class AccessError:
     status_code: int | None = None
     final_url: str = ""
     source_pages: list[str] = field(default_factory=list)  # pages that linked here
+    source_refs: list[SourceRef] = field(default_factory=list)  # page + href + link text
 
 
 @dataclass
@@ -429,7 +438,7 @@ def check_lang(page_url: str, soup: BeautifulSoup, html: str) -> list[Issue]:
 
 def check_html_page(
     page_url: str, html: str, base: urlparse
-) -> tuple[list[Issue], set[str], set[str]]:
+) -> tuple[list[Issue], set[str], set[str], dict[str, list[tuple[str, str]]]]:
     issues: list[Issue] = []
     links: set[str] = set()
     pdfs: set[str] = set()
@@ -511,7 +520,17 @@ def check_html_page(
                 )
             )
 
-    def consider(raw: str) -> None:
+    discoveries: dict[str, list[tuple[str, str]]] = {}  # abs_url -> [(href, link_text)]
+
+    def link_text_for(tag) -> str:
+        if tag.name == "img":
+            return (tag.get("alt") or tag.get("title") or "").strip()[:160]
+        text = " ".join(tag.stripped_strings).strip()
+        if text:
+            return text[:160]
+        return (tag.get("aria-label") or tag.get("title") or "").strip()[:160]
+
+    def consider(raw: str, tag) -> None:
         href = (raw or "").strip()
         if not href or href.startswith("#"):
             return
@@ -521,6 +540,11 @@ def check_html_page(
             return
         if not same_site(base, parsed):
             return
+        text = link_text_for(tag)
+        discoveries.setdefault(abs_url, [])
+        pair = (href, text)
+        if pair not in discoveries[abs_url]:
+            discoveries[abs_url].append(pair)
         if is_pdf_url(abs_url):
             pdfs.add(abs_url)
             return
@@ -542,9 +566,9 @@ def check_html_page(
     for tag in soup.find_all(True):
         for attr in link_attrs:
             if tag.has_attr(attr):
-                consider(tag.get(attr))
+                consider(tag.get(attr), tag)
 
-    return issues, links, pdfs
+    return issues, links, pdfs, discoveries
 
 
 def _unwrap(obj):
@@ -624,12 +648,18 @@ def check_pdf(
     try:
         reader = PdfReader(str(path))
     except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if "cryptography" in msg.lower():
+            msg = (
+                f"{msg} — install dependency: pip install 'cryptography>=3.1' "
+                "(or re-run setup.bat on Windows)"
+            )
         access_errors.append(
             AccessError(
                 url=pdf_url,
                 resource_type="pdf",
                 error_type="parse",
-                message=f"cannot parse PDF: {exc}",
+                message=f"cannot parse PDF: {msg}",
                 final_url=str(resp.url),
             )
         )
@@ -747,6 +777,19 @@ def access_error_from_dict(d: dict[str, Any]) -> AccessError:
     sources = d.get("source_pages") or []
     if isinstance(sources, str):
         sources = [s for s in sources.split(" | ") if s]
+    refs_raw = d.get("source_refs") or []
+    refs: list[SourceRef] = []
+    for r in refs_raw:
+        if isinstance(r, dict):
+            refs.append(
+                SourceRef(
+                    page_url=r.get("page_url", ""),
+                    href=r.get("href", ""),
+                    link_text=r.get("link_text", ""),
+                )
+            )
+    if not refs and sources:
+        refs = [SourceRef(page_url=s) for s in sources]
     return AccessError(
         url=d.get("url", ""),
         resource_type=d.get("resource_type", "page"),
@@ -754,7 +797,8 @@ def access_error_from_dict(d: dict[str, Any]) -> AccessError:
         message=d.get("message", ""),
         status_code=d.get("status_code"),
         final_url=d.get("final_url", ""),
-        source_pages=list(sources),
+        source_pages=list(sources) if sources else sorted({r.page_url for r in refs if r.page_url}),
+        source_refs=refs,
     )
 
 
@@ -769,7 +813,7 @@ def save_checkpoint(
     frontier_pages: list[str],
     frontier_pdfs: list[str],
     max_pages: int,
-    link_sources: dict[str, set[str]] | None = None,
+    link_sources: dict[str, list[SourceRef]] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -788,7 +832,8 @@ def save_checkpoint(
         "issues": [asdict(i) for i in report.issues],
         "access_errors": [asdict(e) for e in report.access_errors],
         "link_sources": {
-            k: sorted(v) for k, v in sorted((link_sources or {}).items())
+            k: [asdict(r) for r in v]
+            for k, v in sorted((link_sources or {}).items())
         },
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
@@ -951,20 +996,34 @@ def crawl(
     in_flight_pdfs: set[str] = set()
     pending_pages: set[str] = set()
     pending_pdfs: set[str] = set()
-    link_sources: dict[str, set[str]] = {}
+    link_sources: dict[str, list[SourceRef]] = {}
     progress = Progress(show_progress, max_pages)
 
-    def note_source(target: str, source: str) -> None:
-        if not target or not source:
+    # target URL -> list of SourceRef
+    def note_source(
+        target: str,
+        page_url: str,
+        href: str = "",
+        link_text: str = "",
+    ) -> None:
+        if not target or not page_url:
             return
-        link_sources.setdefault(target, set()).add(source)
+        refs = link_sources.setdefault(target, [])
+        key = (page_url, href, link_text)
+        if any((r.page_url, r.href, r.link_text) == key for r in refs):
+            return
+        refs.append(SourceRef(page_url=page_url, href=href, link_text=link_text))
 
-    def sources_for(url: str) -> list[str]:
-        return sorted(link_sources.get(url, set()))
+    def refs_for(url: str) -> list[SourceRef]:
+        return list(link_sources.get(url, []))
 
     def with_sources(err: AccessError) -> AccessError:
-        if not err.source_pages:
-            err.source_pages = sources_for(err.url)
+        refs = refs_for(err.url)
+        if refs:
+            err.source_refs = refs
+            err.source_pages = sorted({r.page_url for r in refs if r.page_url})
+        elif not err.source_pages:
+            err.source_pages = []
         return err
 
     if resume and checkpoint_path.is_file():
@@ -989,7 +1048,19 @@ def crawl(
         pending_pages = set(data.get("frontier_pages", []))
         pending_pdfs = set(data.get("frontier_pdfs", []))
         for target, sources in (data.get("link_sources") or {}).items():
-            link_sources[target] = set(sources)
+            refs: list[SourceRef] = []
+            for item in sources:
+                if isinstance(item, dict):
+                    refs.append(
+                        SourceRef(
+                            page_url=item.get("page_url", ""),
+                            href=item.get("href", ""),
+                            link_text=item.get("link_text", ""),
+                        )
+                    )
+                elif isinstance(item, str):
+                    refs.append(SourceRef(page_url=item))
+            link_sources[target] = refs
         progress.line(
             f"Resumed checkpoint: {report.pages_crawled} pages, "
             f"{report.pdfs_checked} PDFs, {len(report.issues)} issues, "
@@ -1188,16 +1259,17 @@ def crawl(
                 ok = True
                 return set(), set()
 
-            page_issues, links, pdfs = check_html_page(final_url, resp.text, base)
+            page_issues, links, pdfs, discoveries = check_html_page(
+                final_url, resp.text, base
+            )
             with lock:
                 if final_url not in report.pages:
                     report.pages.append(final_url)
                     report.pages_crawled += 1
                 report.issues.extend(page_issues)
-                for link in links:
-                    note_source(link, final_url)
-                for pdf in pdfs:
-                    note_source(pdf, final_url)
+                for target, pairs in discoveries.items():
+                    for href, link_text in pairs:
+                        note_source(target, final_url, href=href, link_text=link_text)
             ok = True
             return links, pdfs
         finally:
@@ -1397,13 +1469,25 @@ def write_outputs(report: CrawlReport, out_dir: Path) -> None:
         "message",
         "final_url",
         "source_pages",
+        "source_hrefs",
+        "source_link_texts",
     ]
     with open(errors_csv, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=err_fields)
         w.writeheader()
         for e in report.access_errors:
-            row = asdict(e)
-            row["source_pages"] = " | ".join(e.source_pages)
+            refs = e.source_refs or [SourceRef(page_url=p) for p in e.source_pages]
+            row = {
+                "url": e.url,
+                "resource_type": e.resource_type,
+                "error_type": e.error_type,
+                "status_code": e.status_code,
+                "message": e.message,
+                "final_url": e.final_url,
+                "source_pages": " | ".join(r.page_url for r in refs if r.page_url),
+                "source_hrefs": " | ".join(r.href for r in refs if r.href),
+                "source_link_texts": " | ".join(r.link_text for r in refs if r.link_text),
+            }
             w.writerow(row)
 
     with open(errors_json, "w", encoding="utf-8", newline="\n") as f:
@@ -1439,11 +1523,19 @@ def write_outputs(report: CrawlReport, out_dir: Path) -> None:
     err_lines.append("Details:")
     for e in report.access_errors:
         code = f" HTTP {e.status_code}" if e.status_code else ""
-        src = ", ".join(e.source_pages) if e.source_pages else "(unknown)"
         err_lines.append(
             f"- [{e.resource_type}/{e.error_type}]{code} {e.url} — {e.message}"
         )
-        err_lines.append(f"    found on: {src}")
+        refs = e.source_refs or [SourceRef(page_url=p) for p in e.source_pages]
+        if not refs:
+            err_lines.append("    found on: (unknown)")
+        for r in refs:
+            bits = [r.page_url or "(unknown page)"]
+            if r.href:
+                bits.append(f'href="{r.href}"')
+            if r.link_text:
+                bits.append(f'link_text="{r.link_text}"')
+            err_lines.append("    found on: " + " · ".join(bits))
     errors_txt.write_text("\n".join(err_lines) + "\n", encoding="utf-8", newline="\n")
 
     by_sev: dict[str, int] = {}

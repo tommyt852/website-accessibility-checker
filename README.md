@@ -48,6 +48,7 @@ python -m venv .venv
 # macOS/Linux:
 source .venv/bin/activate
 pip install -r requirements.txt
+# includes cryptography (needed to open AES-encrypted PDFs)
 ```
 
 ## Run
@@ -72,5 +73,5 @@ Options:
 Outputs:
 
 - `summary.txt`, `issues.csv`, `report.json` — accessibility findings
-- `error_report.txt`, `errors.csv`, `error_report.json` — pages/PDFs that failed to open (HTTP error, timeout, connection, robots, save/parse), including **source pages** that linked to them
+- `error_report.txt`, `errors.csv`, `error_report.json` — pages/PDFs that failed to open (HTTP error, timeout, connection, robots, save/parse), including **source pages**, original `href`/`src`, and link text when available
 - `checkpoint.json` — only if interrupted / for `--resume`
