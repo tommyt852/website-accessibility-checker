@@ -39,7 +39,7 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from pypdf.generic import DictionaryObject, IndirectObject
 
-USER_AGENT = "WebsiteA11yCheck/1.10 (+WCAG 2.1 AA crawl)"
+USER_AGENT = "WebsiteA11yCheck/1.11 (+WCAG 2.1 AA crawl)"
 BG_IMAGE_RE = re.compile(
     r"background(?:-image)?\s*:\s*[^;]*url\s*\(\s*[\'\"]?([^)\'\"]+)[\'\"]?\s*\)",
     re.IGNORECASE,
@@ -60,6 +60,14 @@ def configure_stdio() -> None:
 
 
 @dataclass
+class SourceRef:
+    """Where a URL (failed access or PDF issue) was discovered."""
+    page_url: str
+    href: str = ""  # original attribute value when known
+    link_text: str = ""
+
+
+@dataclass
 class Issue:
     page_url: str
     kind: str
@@ -67,14 +75,8 @@ class Issue:
     wcag: str
     detail: str
     resource: str = ""
-
-
-@dataclass
-class SourceRef:
-    """Where a failed URL was discovered."""
-    page_url: str
-    href: str = ""  # original attribute value when known
-    link_text: str = ""
+    source_pages: list[str] = field(default_factory=list)
+    source_refs: list[SourceRef] = field(default_factory=list)
 
 
 @dataclass
@@ -763,6 +765,22 @@ def check_pdf(
 
 
 def issue_from_dict(d: dict[str, Any]) -> Issue:
+    sources = d.get("source_pages") or []
+    if isinstance(sources, str):
+        sources = [s for s in sources.split(" | ") if s]
+    refs_raw = d.get("source_refs") or []
+    refs: list[SourceRef] = []
+    for r in refs_raw:
+        if isinstance(r, dict):
+            refs.append(
+                SourceRef(
+                    page_url=r.get("page_url", ""),
+                    href=r.get("href", ""),
+                    link_text=r.get("link_text", ""),
+                )
+            )
+    if not refs and sources:
+        refs = [SourceRef(page_url=s) for s in sources]
     return Issue(
         page_url=d.get("page_url", ""),
         kind=d.get("kind", ""),
@@ -770,6 +788,10 @@ def issue_from_dict(d: dict[str, Any]) -> Issue:
         wcag=d.get("wcag", ""),
         detail=d.get("detail", ""),
         resource=d.get("resource", ""),
+        source_pages=list(sources)
+        if sources
+        else sorted({r.page_url for r in refs if r.page_url}),
+        source_refs=refs,
     )
 
 
@@ -1026,6 +1048,15 @@ def crawl(
             err.source_pages = []
         return err
 
+    def with_issue_sources(issue: Issue, target_url: str | None = None) -> Issue:
+        """Attach discovery sources (mainly for PDF issues)."""
+        target = target_url or issue.resource or issue.page_url
+        refs = refs_for(target)
+        if refs:
+            issue.source_refs = refs
+            issue.source_pages = sorted({r.page_url for r in refs if r.page_url})
+        return issue
+
     if resume and checkpoint_path.is_file():
         data = load_checkpoint(checkpoint_path)
         ck_start = normalize_url(data.get("start_url", ""))
@@ -1242,7 +1273,9 @@ def crawl(
                     try:
                         pdf_issues, pdf_errs = check_pdf(session, final_url, pdf_tmp)
                         with lock:
-                            report.issues.extend(pdf_issues)
+                            report.issues.extend(
+                                with_issue_sources(i, final_url) for i in pdf_issues
+                            )
                             report.access_errors.extend(
                                 with_sources(e) for e in pdf_errs
                             )
@@ -1292,7 +1325,9 @@ def crawl(
                 return set(), set()
             pdf_issues, pdf_errs = check_pdf(session, url, pdf_tmp)
             with lock:
-                report.issues.extend(pdf_issues)
+                report.issues.extend(
+                    with_issue_sources(i, url) for i in pdf_issues
+                )
                 report.access_errors.extend(with_sources(e) for e in pdf_errs)
                 report.pdfs_checked += 1
             done = True
@@ -1454,12 +1489,37 @@ def write_outputs(report: CrawlReport, out_dir: Path) -> None:
             indent=2,
         )
 
-    fields = ["page_url", "kind", "severity", "wcag", "detail", "resource"]
+    fields = [
+        "page_url",
+        "kind",
+        "severity",
+        "wcag",
+        "detail",
+        "resource",
+        "source_pages",
+        "source_hrefs",
+        "source_link_texts",
+    ]
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for i in report.issues:
-            w.writerow(asdict(i))
+            refs = i.source_refs or [SourceRef(page_url=p) for p in i.source_pages]
+            w.writerow(
+                {
+                    "page_url": i.page_url,
+                    "kind": i.kind,
+                    "severity": i.severity,
+                    "wcag": i.wcag,
+                    "detail": i.detail,
+                    "resource": i.resource,
+                    "source_pages": " | ".join(r.page_url for r in refs if r.page_url),
+                    "source_hrefs": " | ".join(r.href for r in refs if r.href),
+                    "source_link_texts": " | ".join(
+                        r.link_text for r in refs if r.link_text
+                    ),
+                }
+            )
 
     err_fields = [
         "url",
