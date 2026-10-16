@@ -1299,7 +1299,12 @@ def crawl(
                 if final_url not in report.pages:
                     report.pages.append(final_url)
                     report.pages_crawled += 1
-                report.issues.extend(page_issues)
+                for issue in page_issues:
+                    # HTML findings: source page is the page itself
+                    if not issue.source_pages:
+                        issue.source_pages = [final_url]
+                        issue.source_refs = [SourceRef(page_url=final_url)]
+                    report.issues.append(issue)
                 for target, pairs in discoveries.items():
                     for href, link_text in pairs:
                         note_source(target, final_url, href=href, link_text=link_text)
